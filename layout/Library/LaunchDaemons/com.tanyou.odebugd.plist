@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ODebug 常驻调试服务：LaunchDaemon(root)，安全模式下照旧运行（插件内 4321 控制台会消失） -->
+	<key>Label</key>
+	<string>com.tanyou.odebugd</string>
+	<!-- roothide 的 dpkg 安装时会把它改写成 <jbroot>/usr/bin/odebugd（与 frida-server 的 plist 同理） -->
+	<key>Program</key>
+	<string>/usr/bin/odebugd</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>ExecuteAllowed</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/odebugd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/odebugd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+Package: com.tanyou.odebug
+Name: ODebug
+Depends: mobilesubstrate
+Architecture: iphoneos-arm64e
+Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322，安全模式下仍可用
+Maintainer: tanyou
+Author: tanyou
+Section: Tweaks
+Version: 1.0.120
+Changelog:
+ 1.0.120: odebugd 增「安全模式自动兜底」看门狗（!auto status/on/off/run）：每 5 秒查 SpringBoard 有没有 ODebug.dylib，没有就自动注入 ⇒ 安全模式下无需 respring 即让 4321 控制台回来（新起的 SpringBoard 用户态线程多，实测第 0 轮即成功）；注入改为等「用户态窗口」并跳过落在 libsystem_kernel syscall 桩上的线程；主动 respring 不再被误判为崩溃循环；!safe status 改为直接读标记（不再用「控制台能应答 ⇒ 不是安全模式」反推）。
+ 1.0.119: 新增常驻调试服务 odebugd（LaunchDaemon/root/端口4322）：安全模式下插件内 4321 控制台必然消失，odebugd 从进程外工作 ⇒ 提供保命通道（!safe on / on all / off / respring / status）与 root 调试（!ps / !ls / !cat / !plist read / !sys / !log），并附 task_for_pid + 远程 VM + 远程线程的注入可行性探针 !tp <pid>。
+ 1.0.118: 安全模式进出（TANSafeMode）：标记路径改为 <jbroot>/var/mobile/.eksafemode（真机实测生效路径，写真实 /var/mobile/.eksafemode 无效）；控制台增 !safe on/off/status/respring；odebug.sh 增 frida 兜底通道、自动 iproxy 与 stdout 提示符修复；README 补双通道与端到端实测。
+ 1.0.117: 控制台/设置页/AltList 选取目标 App；TANHookAutoRestore 延迟到启动 6 秒。

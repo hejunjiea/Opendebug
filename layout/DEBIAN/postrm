@@ -1,0 +1,42 @@
+#!/bin/sh
+# ODebug postrm：**卸载时**清掉「安全模式标记软链」与「标记文件」，
+# 免得卸载后设备还停在安全模式（用户没删标记文件就再也进不去 tweak）。
+#
+# ★ 必须判断 dpkg 参数：dpkg 升级时会先调用**旧包**的 postrm，参数是 `upgrade <新版本>`。
+#   早期版本没做判断 ⇒ 每次装新版都把用户的安全模式状态悄悄清掉（真机实测：装 1.0.120 后
+#   标记消失、SpringBoard 又注满 47 个 tweak，表现为「升级把我弹出安全模式」）。
+#   现在只在真正卸载/清除（remove|purge|disappear）时清理。
+#
+# 注意两个路径不是一回事（真机实测）：
+#   ★ 生效标记 = <jbroot>/var/mobile/.eksafemode  ⇒ 在维护脚本里就是 /var/jb/var/mobile/.eksafemode
+#     （注入器检查 /var/jb/basebin/.safe_mode 这个软链，并按 jbroot 侧语义解析它的目标）
+#   · /var/mobile/.eksafemode 是真实根路径下的同名文件：本机注入器不看它，
+#     但旧版 ODebug 误写过，所以一并清掉。
+ACTION="$1"
+SVC=/var/jb/Library/LaunchDaemons/com.tanyou.odebugd.plist
+
+case "$ACTION" in
+remove|purge|disappear)
+    # 只有真的不要这个包了才停常驻服务；升级由 postinst 自己 unload → 重签 → load
+    if [ -f "$SVC" ]; then
+        launchctl unload -w "$SVC" 2>/dev/null
+    fi
+
+    SAFE_MARK=/var/jb/basebin/.safe_mode
+    SAFE_FLAG=/var/jb/var/mobile/.eksafemode
+    SAFE_FLAG_LEGACY=/var/mobile/.eksafemode
+    if [ -L "$SAFE_MARK" ]; then
+        rm -f "$SAFE_MARK"
+    fi
+    for f in "$SAFE_FLAG" "$SAFE_FLAG_LEGACY"; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+        fi
+    done
+    ;;
+*)
+    # upgrade / failed-upgrade / abort-upgrade / abort-remove …：保留安全模式状态不动
+    ;;
+esac
+
+exit 0

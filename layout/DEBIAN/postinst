@@ -1,0 +1,64 @@
+#!/bin/sh
+# ODebug postinst
+# ODebug.plist → 软链 → com.tanyou.opendebug.settings 域的 CFPreferences plist。
+# 原因：Settings 写 Filter 必须走 CFPreferences（cfprefsd 写真实文件）；NSFileManager 会被沙盒
+# 容器虚拟化写不到真实路径。loader 读 ODebug.plist 跟随软链读到同一份文件。
+TARGET=/var/mobile/Library/Preferences/com.tanyou.opendebug.settings.plist
+PLIST=/var/jb/Library/MobileSubstrate/DynamicLibraries/ODebug.plist
+
+# 目标不存在时写入默认 Filter（仅 SpringBoard），属主改 mobile 让 cfprefsd/mobile 可写
+if [ ! -f "$TARGET" ]; then
+    cat > "$TARGET" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.springboard</string>
+		</array>
+	</dict>
+</dict>
+</plist>
+PLIST
+    chown mobile:mobile "$TARGET"
+    chmod 644 "$TARGET"
+fi
+
+rm -f "$PLIST"
+ln -s "$TARGET" "$PLIST"
+
+# 安全模式标记软链：注入器检查 <jbroot>/basebin/.safe_mode，但 basebin 是 root:wheel 0755 ⇒ mobile 写不了。
+# 实测注入器**跟随软链**（悬空软链 = 不生效 = 正常注入），所以软链到 mobile 可写的 /var/mobile/.eksafemode：
+# SpringBoard 侧创建/删除该文件即可进出安全模式，无需 root 组件。
+SAFE_MARK=/var/jb/basebin/.safe_mode
+SAFE_FLAG=/var/mobile/.eksafemode
+mkdir -p /var/jb/basebin 2>/dev/null
+# 旧软链重建；普通文件（frida SOP 用 root 写的遗留标记）清掉，否则装完仍处安全模式
+if [ -L "$SAFE_MARK" ] || [ -e "$SAFE_MARK" ]; then
+    rm -f "$SAFE_MARK"
+fi
+ln -s "$SAFE_FLAG" "$SAFE_MARK"
+chown -h root:wheel "$SAFE_MARK" 2>/dev/null
+
+# 常驻调试服务 odebugd（LaunchDaemon，root）：安全模式下插件内 4321 控制台会消失，
+# 它是插件外的独立进程，所以安全模式下照旧可用（查/删标记、重启 SpringBoard、root 调试）。
+#
+# 关键：LaunchDaemon 默认被沙盒限制（实测 sysctl 列进程失败、读不到 jbroot），
+# 所以先用**设备自己的** ldid 按 odebugd.ent 重签（theos 构建时的签名在真机上不保证被认），
+# 再交给 launchd 加载。重签前必须先 unload，避免对正在运行的映像动刀。
+SVC=/var/jb/Library/LaunchDaemons/com.tanyou.odebugd.plist
+ENT=/var/jb/usr/share/odebugd/odebugd.ent
+BIN=/var/jb/usr/bin/odebugd
+if [ -f "$SVC" ]; then
+    launchctl unload "$SVC" 2>/dev/null
+fi
+if [ -x /var/jb/usr/bin/ldid ] && [ -f "$ENT" ] && [ -f "$BIN" ]; then
+    /var/jb/usr/bin/ldid -S"$ENT" "$BIN" 2>&1 | head -3
+fi
+if [ -f "$SVC" ]; then
+    launchctl load -w "$SVC" 2>/dev/null
+fi
+exit 0
