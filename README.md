@@ -470,9 +470,17 @@ SpringBoard 若在**安全模式开启时**启动，tweak 加载器就没跑 ⇒
 | 安全模式（不干预） | 1266 | **0 个** | ❌ 死 |
 | 安全模式 + 自动兜底 | 1267 | **只有 ODebug** | ✅ 当场复活 |
 
-关键是注入器走「劫持线程直接 `dlopen`」，**绕过了加载器那层封锁** ⇒ 只放行你指定的那一个 dylib，
-其它插件依旧一个都不注入（标记还在 ⇒ 安全模式语义不变）。所以「所有插件禁止注入」不但能用，
-还可以长期这么跑：odebugd + ODebug 控制台照常，其它插件全灭。
+关键是注入器**从进程外往 SpringBoard 里造一条正规 pthread，再让这条线程去 `dlopen`**
+（走 Apple 私有 SPI `pthread_create_from_mach_thread`，链路见下面「frida 式注入器」一节）⇒
+它绕过了加载器那层封锁：只放行你指定的那一个 dylib，其它插件依旧一个都不注入
+（标记还在 ⇒ 安全模式语义不变）。所以「所有插件禁止注入」不但能用，还可以长期这么跑：
+odebugd + ODebug 控制台照常，其它插件全灭。
+
+> **1.0.141 真机端到端实测（2026-10-05）**：`!safe on` ⇒ 标记写入 + SpringBoard 被 SIGKILL ⇒ 新 SpringBoard
+> 进安全模式（`!safe status` 报 `当前: 存在 ⇒ 安全模式(新进程不注入 tweak)`，里面一个 tweak 都没有）。
+> 5 秒内看门狗自动兜底 ⇒ `!auto status`：`SpringBoard pid=47670，ODebug.dylib 已在镜像表里 ✅`；
+> **`iproxy 4321 4321` 当场就连上并收到 `ODebug 调试控制台` 横幅**（无需 respring、无需人工干预）。
+> 随后 `!safe off` ⇒ 标记移除、SpringBoard(47730) 由越狱自己注入 ODebug ⇒ 一切照旧。
 
 > 4321 的 `!safe status` 会照实说明这一点（早期版本拿「我能应答 ⇒ 不是安全模式」反推，会误报）：
 > ```
@@ -503,15 +511,37 @@ SpringBoard 1225 个镜像里**只有 ODebug 一个 tweak**、4321 控制台照�
 > 而 dpkg 升级时会先调用**旧包**的 `postrm upgrade` ⇒ 每次装新版都顺手删掉安全模式标记。
 > 现在只在 `remove|purge|disappear` 时清理。
 
+### frida 式注入器（1.0.121 起，1.0.141 定型）
+
+对照 frida-core 的 `frida-helper-backend-glue.m` 逐行复刻，链路是：
+
+1. 在目标里各分配一页：**代码页**（写完再 `mach_vm_protect(R\|X)`）与**数据页**（路径字符串 + 各槽位）；
+2. `thread_create` + `thread_set_state`（PC=代码页入口、LR=`pause`、SP=自己分配的一页栈）起一条**裸 mach 线程**；
+   PC/LR 必须按「签名形态」交给内核（见下表 PAC 那条）；
+3. 裸线程第一件事写 canary（`0x0DB60001` 写进数据页）⇒ 用它区分「代码页压根没执行」与「dlopen 失败」；
+   接着 `pthread_create_from_mach_thread(&slot, NULL, paciza(routine), data)`，然后自己在 `pause()` 里死循环停车；
+4. routine（跑在**正规 pthread** 上）`dlopen(path, RTLD_NOW|RTLD_GLOBAL)` ⇒ 返回值 + 完成标记 `0xC0FFEE` 写回数据页 ⇒ `pthread_exit`；
+5. daemon 轮询数据页与目标镜像表：canary ✓ 且镜像出现 ⇒ 成功（`!fd` 还会把 `dlopen` 句柄读回来给人看）。
+
+> **为什么不能图省事直接在裸线程上 `pthread_create`**：真机实测那样会把**整个目标进程**搞死
+> （`pthread_t` 槽一直是 0、进程 1 秒内从进程表消失）。frida 同样优先用 `pthread_create_from_mach_thread`
+> （Apple 私有 SPI，能从裸线程安全地建 pthread），`pthread_create` 只是它的退路。
+> 另外注意 frida 的参数约定是 4 个：`x0=&slot`、`x1=NULL`、`x2=paciza(routine)`、`x3=arg`。
+
 ### 进程外注入器的硬约束（都是真机踩出来的）
 
 | 约束 | 现象 / 做法 |
 |------|------|
 | **PAC：PC/SP/LR 必须按「签名形态」交给内核** | 只能用 SDK 访问器 `__darwin_arm_thread_state64_set_pc_fptr()` / `_set_lr_fptr()`（内部 `ptrauth_auth_and_resign` 并清 `KERNEL_SIGNED_PC`）。把 `thread_get_state` 读回来的原始 `__opaque_pc` 再喂给 `ptrauth_sign_unauthenticated` ⇒ 鉴别符不匹配 ⇒ 命中 **auth 陷阱 `brk #0xc470`（SIGBUS）把 odebugd 自己打死** |
 | **剥离 PAC 用 47 位掩码** | `v & 0x00007FFFFFFFFFFF`；掩 48 位会把用户态最高位 VA 当成保留位，解析出垃圾地址 |
-| **匿名 RWX 页取指会被内核判死** | 连 `b .` 自旋都会被 W^X/代码签名杀掉 ⇒ 远端**只能执行共享缓存里已签名的代码**（`dlopen` / `write` / `pause`…），所以注入手段是「劫持线程去调 `dlopen`」 |
-| **阻塞在 syscall 里的线程改 PC 无效** | 内核按 syscall 返回路径走、忽略 pcb 里的 PC；`thread_abort` 也救不了（实测返回 `successful` 但目标毫无变化）⇒ **必须等「用户态窗口」**（`TH_STATE_RUNNING`，且 PC 不在 `libsystem_kernel` 的 syscall 桩 `svc` 附近） |
+| **匿名 R\|X 页取指没问题（旧结论已推翻）** | 1.0.125 用 `!rx <pid> target` 实测：目标里 `mach_vm_allocate` + 写码 + `mach_vm_protect(R\|X)`，裸线程一跑 **100 ms 内 canary 就出现、目标存活** ⇒ 匿名可执行页可以取指。早期「一取指就被杀」的真因是 stub 里那个 `pthread_create`，以及「spawn 完立刻注入撞上 dyld 镜像表还没就绪」 |
+| **阻塞在 syscall 里的线程改 PC 无效** | 内核按 syscall 返回路径走、忽略 pcb 里的 PC；`thread_abort` 也救不了 ⇒ 旧劫持法**必须等「用户态窗口」**（`TH_STATE_RUNNING` 且 PC 不在 `libsystem_kernel` 的 syscall 桩附近）。frida 式的**新建线程**不走这条：它的 PC 是我们自己设定的，随时能起 |
 | **被劫持线程要「停车」而不是返回** | LR 设成远端 `pause`：线程跑完 `dlopen` 停在那里不返回原处（返回会破坏原调用栈），宿主读 x0 拿返回值后再把原状态写回 |
+| **不能在注入线程上调 `dlerror()`** | 1.0.137/1.0.139 两次真机教训：canary 已写、目标 5 秒内换 pid ⇒ `dlerror` 依赖 dyld 自己的**每线程**错误状态，而这条线程不是 dyld 初始化出来的（地址校验是通过的，所以不是偏移问题）⇒ 注入流程彻底不碰 `dlerror`，失败只看 `dlopen` 返回值 + 镜像表 |
+| **dylib 路径要用越狱真正注入用的那条** | roothide 实际注入的是 `<jbroot>/usr/lib/TweakInject/ODebug.dylib`（真机 `!fd` 用这个路径把镜像载进了越狱进程且目标存活）⇒ 兜底路径优先取它，旧的 `<jbroot>/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib` 作后备 |
+| **spawn 完要等约 2 秒再注入** | 目标刚 resume 时 dyld 镜像表可能还没就绪 ⇒ `remoteImages` 返回 0 张 ⇒ 符号全解析成 0 ⇒ stub 里 `blr 0` 当场把目标打死（这是早期 `fdbug`/`payload` 模式「秒死」的真正原因，不是布局问题） |
+| **daemon 侧读「带 PAC 的指针」必须走 `vmRead`** | 1.0.138 的字节校验直接 `memcpy` 解引用 `dlsym` 返回的指针 ⇒ arm64e 上带签名位 ⇒ daemon **SIGSEGV 每 5 秒崩溃重启循环**（日志回溯直指 `odbgSymbolBytesMatch`）⇒ 改成 `vmRead(mach_task_self(), stripPAC(addr), …)` 两侧都走 `vmRead` |
+| **不要对目标里我们新建的线程调 `thread_terminate`** | 真机实测：`thread_terminate` 会让 **odebugd 自己被内核当场杀掉**（多半 EXC_GUARD）⇒ 线程就让它停在目标的 `pause` 里，随目标进程消失 |
 | **依赖符号** | `ODebug.dylib` 只需要 `MSHookMessageEx`；roothide 每个进程（含安全模式下的 SB）都带 `basebin/fallback/CydiaSubstrate` ⇒ 通常无需预加载，探不到才先注 `libellekit` |
 
 ### 构建与安装（开发循环）
@@ -537,7 +567,7 @@ ssh -p 2222 mobile@127.0.0.1 'sudo dpkg -i /tmp/install.deb'
 
 ### 已知限制
 
-1. **窗口率决定注入耗时**：SB 忙（刚启动/正在交互）几乎秒成；SB 全空闲（屏幕熄灭）可能要等几分钟，甚至一直等不到 ⇒ 点亮屏幕/摸一下屏幕能显著加快。
+1. **1.0.141 起不再依赖「用户态窗口」**（frida 式新建线程，PC 由我们设定）⇒ 屏幕熄灭、SpringBoard 全空闲也能注入；实测安全模式下 SB 重启后 5 秒内就注完了。
 2. **注入后 SB 里只有 ODebug**：其它 tweak 要 `!safe off` + `!safe respring` 才回来。
 3. 设备上**没有 `pkill`**（`/usr/bin/sh: 1: pkill: not found`），清理测试用的一次性进程要用别的手段。
 

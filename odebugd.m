@@ -63,9 +63,17 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target, mach_vm_address_t a
                                             mach_vm_size_t *outsize);
 
 static NSString *gJbroot = nil;
+
+/// 兜底注入用的插件路径。roothide 把 tweak 实际注入用的副本放在 <jbroot>/usr/lib/TweakInject/ODebug.dylib
+/// （真机实测：用这个路径 !fd 能把镜像载进越狱进程、且目标存活），旧的 DynamicLibraries 路径留作后备。
+static NSString *odbgDefaultPluginPath(void) {
+    NSString *inject = [gJbroot stringByAppendingString:@"/usr/lib/TweakInject/ODebug.dylib"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:inject]) return inject;
+    return [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib"];
+}
 static NSString *gLogPath = nil;
 static int gPort = 4322;
-static NSString *gVersion = @"1.0.120";
+static NSString *gVersion = @"1.0.141";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -530,7 +538,534 @@ static void *odbgSignSP(uint64_t raw) {
 }
 #endif
 
-static kern_return_t remoteDlopen(task_t task, const char *path, NSString **detail) {
+// ── 手写 arm64 stub 需要的一小把指令发射器（偏移 0，配合 add 用）────────────────
+static void emitInsn(uint32_t *p, int *n, uint32_t insn) { if (*n < 1000) p[(*n)++] = insn; }
+static void emitAddImm(uint32_t *p, int *n, int rd, int rn, uint32_t imm) {
+    emitInsn(p, n, 0x91000000u | ((imm & 0xFFFu) << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+}
+static void __attribute__((unused)) emitLdr32(uint32_t *p, int *n, int rt, int rn) { emitInsn(p, n, 0xB9400000u | ((uint32_t)rn << 5) | (uint32_t)rt); }
+static void emitStr32(uint32_t *p, int *n, int rt, int rn) { emitInsn(p, n, 0xB9000000u | ((uint32_t)rn << 5) | (uint32_t)rt); }
+static void emitStr64(uint32_t *p, int *n, int rt, int rn) { emitInsn(p, n, 0xF9000000u | ((uint32_t)rn << 5) | (uint32_t)rt); }
+static void emitBlr(uint32_t *p, int *n, int rn) { emitInsn(p, n, 0xD63F0000u | ((uint32_t)rn << 5)); }
+static void emitRet(uint32_t *p, int *n) { emitInsn(p, n, 0xD65F03C0u); }
+// PACIZA <Xd>：给函数指针签名。arm64e 的 _pthread_start 用认证分支调回调，不签就当场 auth-trap。
+static void emitPaciza(uint32_t *p, int *n, int rd) { emitInsn(p, n, 0xDAC123E0u | (uint32_t)rd); }
+// b <label>：imm26 相对当前这条指令
+static void emitBLabel(uint32_t *p, int *n, int targetIdx) {
+    emitInsn(p, n, 0x14000000u | ((uint32_t)(targetIdx - *n) & 0x03FFFFFFu));
+}
+// 回填 emitMov64 占位（占位时还不知道 routine 的地址）
+static void patchMov64(uint32_t *p, int idx, int rd, uint64_t val) {
+    p[idx]     = 0xD2800000u | ((uint32_t)(val & 0xFFFF) << 5) | (uint32_t)rd;
+    p[idx + 1] = 0xF2A00000u | ((uint32_t)((val >> 16) & 0xFFFF) << 5) | (uint32_t)rd;
+    p[idx + 2] = 0xF2C00000u | ((uint32_t)((val >> 32) & 0xFFFF) << 5) | (uint32_t)rd;
+    p[idx + 3] = 0xF2E00000u | ((uint32_t)((val >> 48) & 0xFFFF) << 5) | (uint32_t)rd;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// frida 式注入：新线程 + 「写 R/W 再翻 R+X」的代码页 + stub 里 pthread_create
+//
+// 依据 frida 16.1.4（源码 /Users/tanyou/Desktop/1study_ios_tweak/000-frida/frida）：
+//   frida-core/src/darwin/frida-helper-backend-glue.m:2277-2360  payload 分配 / 代码页翻 R+X / 数据页
+//                                                :2390-2430  thread_create + set_state
+//                                                :4816-4927  arm64 mach stub（paciza 回调 + mach_msg_receive 停车）
+//                                                :4930-5010  arm64 pthread stub（dlopen/dlsym + 收尾）
+// 相对我们旧的「劫持线程」法，四件事被改掉了：
+//   1) 不等用户态窗口：thread_create 直接在目标里造一个新线程（空闲 SpringBoard 也能立刻起来）；
+//   2) 匿名 RWX 页取指必崩 ⇒ 严格「mach_vm_allocate 可写 → 写 stub → mach_vm_protect(R|X)」；
+//      （frida 的 gum/gummemory.c:207 在 Darwin arm64 上把 rwx 支持写死成 NONE，就是这条约束）
+//   3) 裸 mach 线程没有 pthread/TLS ⇒ 它只允许调 mach 层 API（task_self_trap /
+//      thread_self_trap / mach_port_allocate / pthread_create），真正的 dlopen 交给
+//      pthread_create 出来的正规 pthread 干；
+//   4) arm64e 的 _pthread_start 用认证分支调回调 ⇒ 传回调前必须 paciza（0xdac123e2）。
+//
+// 数据流：裸线程写 canary ⇒ 证明代码页真的执行了；pthread 写 dlopen 返回值与「收尾完成」标记；
+//         daemon 轮询数据页 + 远端镜像表判定成功，失败时能区分「没跑到／pthread 没造出来／dlopen 失败」。
+// ─────────────────────────────────────────────────────────────────────────────
+#define ODBG_PAYLOAD_CODE_OFF   0x0
+#define ODBG_PAYLOAD_DATA_OFF   0x4000
+#define ODBG_PAYLOAD_STACK_OFF  0x8000
+#define ODBG_PAYLOAD_STACK_SIZE 0x40000
+#define ODBG_PAYLOAD_SIZE       (ODBG_PAYLOAD_STACK_OFF + ODBG_PAYLOAD_STACK_SIZE)
+
+#define ODBG_D_TASK         0     // uint32  task_self_trap() 返回
+#define ODBG_D_MACH_THREAD  4     // uint32  thread_self_trap() 返回（裸线程自己，收尾时终止它）
+#define ODBG_D_RECV_PORT    8     // uint32  mach_port_allocate 的接收端口（裸线程在这上面等一个永不到来的消息）
+#define ODBG_D_PTHREAD_RC   12    // uint32  pthread_create 返回值
+#define ODBG_D_ENTRY_HIT    16    // uint64  canary：代码页第一件事就写它
+#define ODBG_D_DLOPEN_RC    24    // uint64  dlopen 返回值（0 = 失败）
+#define ODBG_D_ROUTINE_DONE 32    // uint64  收尾完成标记（0xC0FFEE）
+#define ODBG_D_THREAD_SLOT  40    // uint64  pthread_create 输出的 pthread_t
+#define ODBG_D_MSG          48    // mach_msg_empty_rcv_t（32 字节）
+#define ODBG_D_MSGH_LOCAL_PORT (ODBG_D_MSG + 12)   // mach_msg_header_t 里 msgh_local_port 的偏移
+#define ODBG_D_DLERR_PTR    88    // uint64 dlerror() 返回的错误字符串指针（dlopen 失败时用）
+#define ODBG_D_PATH         96
+#define ODBG_DATA_BYTES     (ODBG_D_PATH + 1024)
+
+/// 返回 KERN_SUCCESS = 注入成功；*executed = 代码页是否真的跑起来过（决定要不要退回劫持法）
+static uint64_t odbgStatePC(arm_thread_state64_t *st);
+static BOOL odbgParkedInPause(arm_thread_state64_t *st, uint64_t pauseAddr);
+static kern_return_t remoteNewThread2(task_t task, uint64_t pcAddr, uint64_t lrAddr,
+                                      uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                                      uint64_t *stackTopOut, thread_act_t *outTh, NSString **err);
+
+/// 远端符号地址的**字节校验**：远端前 n 字节必须和本进程同名符号一致。
+/// 共享缓存里的代码在进程间逐字节相同，所以「偏移算错了」这种情况会被它挡住——
+/// 真机教训：把 dlopen 的偏移照搬到 dlerror 上时地址错了，目标一调用 dlerror 就整进程被杀。
+__attribute__((unused)) static BOOL odbgSymbolBytesMatch(task_t task, uint64_t cand, uint64_t localAddr, size_t n) {
+    if (task == MACH_PORT_NULL || !cand || !localAddr || n == 0 || n > 64) return NO;
+    uint8_t lb[64], rb[64];
+    // 两边都用 vmRead 读，避免直接解引用（dlsym 返回的指针在 arm64e 上带签名/PAC 位，
+    // 直接 memcpy 会 SIGSEGV —— 1.0.138 就是这么把 daemon 打成崩溃重启循环的）
+    if (!vmRead(mach_task_self(), stripPAC(localAddr), lb, n)) return NO;
+    if (!vmRead(task, cand, rb, n)) return NO;
+    return memcmp(lb, rb, n) == 0;
+}
+
+/// 生成 frida 式注入 stub（返回指令条数）：
+///   ① 裸 mach 线程段：写 canary → pthread_create_from_mach_thread(&slot, paciza(routine), arg)
+///      → 记返回值 → 在 pause 里死循环停车（裸线程交给 pthread 收尾，自己不再返回）
+///   ② pthread 回调段（routine）：dlopen(path, RTLD_NOW|RTLD_GLOBAL) → 记 rc/完成标记 → pthread_exit
+/// 注意：所有地址都是**目标里**的绝对地址，必须等代码页/数据页分配完才能生成。
+static int odbgBuildFridaStub(uint32_t *code, uint64_t codeAddr, uint64_t dataAddr, uint32_t canary,
+                              uint64_t pthreadCreAddr, uint64_t dlopenAddr, uint64_t pthreadExitAddr,
+                              uint64_t dlerrorAddr, uint64_t pauseAddr,
+                              uint64_t *routineAddrOut, uint64_t *parkAddrOut) {
+    int cn = 0;
+    // ① 裸 mach 线程的 stub：canary → pthread_create_from_mach_thread(&slot, paciza(routine), arg)
+    //    → 记返回值 → 在 pause 里死循环停车（裸线程交给 pthread 收尾，自己不再返回）
+    emitMov64(code, &cn, 19, dataAddr);
+    emitMov64(code, &cn, 0, (uint64_t)canary);
+    emitAddImm(code, &cn, 1, 19, ODBG_D_ENTRY_HIT); emitStr64(code, &cn, 0, 1);
+    emitAddImm(code, &cn, 0, 19, ODBG_D_THREAD_SLOT);   // x0 = &slot（pthread_t 输出）
+    emitMov64(code, &cn, 1, 0);                         // x1 = attr = NULL（★ frida 也是这么传的）
+    int routineConstIdx = cn;
+    emitMov64(code, &cn, 2, 0);                         // x2 = routine（占位，稍后回填）
+    emitPaciza(code, &cn, 2);                           // ★ arm64e：回调指针必须签名（C 函数指针 = paciza）
+    emitMov64(code, &cn, 3, dataAddr);                  // x3 = arg（回调参数，本回调用不到）
+    emitMov64(code, &cn, 16, pthreadCreAddr); emitBlr(code, &cn, 16);
+    emitAddImm(code, &cn, 1, 19, ODBG_D_PTHREAD_RC); emitStr32(code, &cn, 0, 1);
+    int parkIdx = cn;                                   // 停车：while (1) pause();
+    emitMov64(code, &cn, 16, pauseAddr); emitBlr(code, &cn, 16);
+    emitBLabel(code, &cn, parkIdx);
+    // ② 正规 pthread 上的 stub：dlopen(path, RTLD_NOW|RTLD_GLOBAL) → 记 rc / 完成标记 → pthread_exit
+    int routineIdx = cn;
+    emitMov64(code, &cn, 19, dataAddr);
+    emitAddImm(code, &cn, 0, 19, ODBG_D_PATH);
+    emitMov64(code, &cn, 1, 3);
+    emitMov64(code, &cn, 16, dlopenAddr); emitBlr(code, &cn, 16);
+    emitAddImm(code, &cn, 1, 19, ODBG_D_DLOPEN_RC); emitStr64(code, &cn, 0, 1);
+    if (dlerrorAddr) {                                  // 成功时 dlerror() 返回 NULL，顺手记下 dyld 的报错文本
+        emitAddImm(code, &cn, 1, 19, ODBG_D_DLERR_PTR);
+        emitMov64(code, &cn, 16, dlerrorAddr); emitBlr(code, &cn, 16);
+        emitStr64(code, &cn, 0, 1);
+    }
+    emitMov64(code, &cn, 0, 0xC0FFEEULL);
+    emitAddImm(code, &cn, 1, 19, ODBG_D_ROUTINE_DONE); emitStr64(code, &cn, 0, 1);
+    if (pthreadExitAddr) { emitMov64(code, &cn, 16, pthreadExitAddr); emitBlr(code, &cn, 16); }
+    emitRet(code, &cn);
+    uint64_t routineAddr = codeAddr + (uint64_t)routineIdx * 4;
+    uint64_t parkAddr    = codeAddr + (uint64_t)parkIdx * 4;
+    patchMov64(code, routineConstIdx, 2, routineAddr);
+    *routineAddrOut = routineAddr;
+    *parkAddrOut = parkAddr;
+    return cn;
+}
+
+static kern_return_t remoteDlopenFrida(task_t task, odbg_image_t *imgs, int n, const char *path,
+                                      NSMutableString *log, BOOL *executed) {
+    *executed = NO;
+    uint64_t dlopenAddr    = remoteSymbol(task, imgs, n, "libdyld.dylib", "dlopen");
+    // ★ 关键教训（真机实测）：裸 mach 线程上直接调 pthread_create 会把靶子进程搞死。
+    //   frida 的解法是优先用 Apple 私有 SPI pthread_create_from_mach_thread（它能从裸线程安全建 pthread）。
+    uint64_t pthreadCreAddr  = remoteSymbol(task, imgs, n, "libsystem_pthread.dylib", "pthread_create_from_mach_thread");
+    uint64_t pthreadExitAddr = remoteSymbol(task, imgs, n, "libsystem_pthread.dylib", "pthread_exit");
+    // ★ 真机教训（1.0.137/1.0.139 两次）：在目标我们新建的 pthread 上调用 dlerror() 会把**整个进程**打死
+    //   （收尾标记写不出、canary 已写、目标 5 秒内换 pid）。地址校验是通过的，所以问题不是偏移，而是
+    //   dlerror 依赖 dyld 自己的每线程错误状态——我们这条线程不是 dyld 初始化出来的。
+    //   ⇒ 注入流程彻底不碰 dlerror（失败时只看 dlopen 返回值 + 镜像表）。
+    uint64_t dlerrorAddr     = 0;
+    uint64_t pauseAddr       = remoteSymbol(task, imgs, n, "libsystem_c.dylib", "pause");
+    const uint32_t canary = 0x0DB60001u;
+    if (!dlopenAddr || !pthreadCreAddr || !pauseAddr) {
+        [log appendFormat:@"[frida] 远端符号不全（dlopen=0x%llx pthread_create_from_mach_thread=0x%llx pause=0x%llx）⇒ 退回劫持法\n",
+                          dlopenAddr, pthreadCreAddr, pauseAddr];
+        return KERN_FAILURE;
+    }
+    // ★ 布局教训（真机实测）：代码页/数据页/栈 **必须各自单独分配**。
+    //   一整块大分配（code+0x0 / data+0x4000 / stack+0x8000 同处一块）在真机上必死：
+    //   把大块里的第一页单独翻成 R|X 之后，目标线程一取指就整进程被杀（同尺寸的独立页则完全正常）。
+    mach_vm_address_t codePage = 0, dataPage = 0;
+    kern_return_t kr = mach_vm_allocate(task, &codePage, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[frida] 代码页分配失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    kr = mach_vm_allocate(task, &dataPage, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[frida] 数据页分配失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    uint64_t codeAddr = (uint64_t)codePage;
+    uint64_t dataAddr = (uint64_t)dataPage;
+    uint64_t stackTop = 0;
+
+    uint32_t code[1024];
+    uint64_t routineAddr = 0, parkAddr = 0;
+    int cn = odbgBuildFridaStub(code, codeAddr, dataAddr, canary, pthreadCreAddr, dlopenAddr,
+                                pthreadExitAddr, dlerrorAddr, pauseAddr, &routineAddr, &parkAddr);
+
+    // 数据页：路径字符串 + 各槽位清零（canary 槽、pthread_t 槽、返回值槽都由 stub 回写）
+    uint8_t data[ODBG_DATA_BYTES];
+    memset(data, 0, sizeof(data));
+    uint32_t msgSize = 32;                                  // 遗留字段：别的路径用，保留无害
+    memcpy(data + ODBG_D_MSG + 4, &msgSize, 4);
+    size_t pathLen = strlen(path) + 1;
+    if (pathLen > 1000) pathLen = 1000;
+    memcpy(data + ODBG_D_PATH, path, pathLen);
+    mach_vm_write(task, dataAddr, (vm_offset_t)data, (mach_msg_type_number_t)sizeof(data));
+    mach_vm_write(task, codeAddr, (vm_offset_t)code, (mach_msg_type_number_t)(cn * 4));
+    // ★ 写 R/W → 翻成 R+X（绝不能是 RWX）；真机 `!rx` 已证实目标里这种页可以取指
+    kr = mach_vm_protect(task, codeAddr, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[frida] 代码页翻 R|X 失败：%s ⇒ 退回劫持法（什么都没执行过，目标没被碰过）\n",
+                          mach_error_string(kr)];
+        return KERN_FAILURE;
+    }
+    [log appendFormat:@"[frida] code@0x%llx data@0x%llx（stub %d 字节，已翻 R|X；"
+                      @"pthread_create_from_mach_thread@0x%llx）\n",
+                      codeAddr, dataAddr, cn * 4, pthreadCreAddr];
+
+    thread_act_t th = MACH_PORT_NULL;
+    NSString *err = nil;
+    kr = remoteNewThread2(task, codeAddr, parkAddr, 0, dataAddr, 0, 0, &stackTop, &th, &err);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[frida] 建线程失败：%s %@ ⇒ 退回劫持法\n", mach_error_string(kr), err ?: @""];
+        return kr;
+    }
+    [log appendFormat:@"[frida] 裸线程已起（PC=代码页入口 0x%llx / SP=0x%llx / LR=停车点 0x%llx）\n",
+                      codeAddr, stackTop, parkAddr];
+
+    const char *leaf = strrchr(path, '/');
+    leaf = leaf ? leaf + 1 : path;
+    BOOL injected = NO;
+    uint64_t canarySeen = 0, dlopenRc = 0, done = 0, slot = 0;
+    uint32_t pthreadRc = 0;
+    for (int k = 0; k < 100 && !injected; k++) {           // 最多 ~10 秒
+        usleep(k < 6 ? 5000 : 100 * 1000);                 // ★ 头几轮 5ms 密集采样：要抓「还没跑就死」的瞬间
+        BOOL canaryOk = vmRead(task, dataAddr + ODBG_D_ENTRY_HIT, &canarySeen, 8);
+        vmRead(task, dataAddr + ODBG_D_PTHREAD_RC, &pthreadRc, 4);
+        vmRead(task, dataAddr + ODBG_D_DLOPEN_RC, &dlopenRc, 8);
+        vmRead(task, dataAddr + ODBG_D_ROUTINE_DONE, &done, 8);
+        vmRead(task, dataAddr + ODBG_D_THREAD_SLOT, &slot, 8);
+        if (k < 6) {
+            arm_thread_state64_t cst; memset(&cst, 0, sizeof(cst));
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t gk = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&cst, &sc);
+            [log appendFormat:@"[frida] #%d canary=%@(0x%llx) 数据页%@ 线程=%@\n", k,
+                              canarySeen == (uint64_t)canary ? @"✓" : @"✗", canarySeen,
+                              canaryOk ? @"可读" : @"读不到",
+                              gk == KERN_SUCCESS ? [NSString stringWithFormat:@"活着 PC=0x%llx", odbgStatePC(&cst)]
+                                                 : [NSString stringWithFormat:@"死(%s)", mach_error_string(gk)]];
+        }
+        odbg_image_t *i2 = NULL;
+        int n2 = remoteImages(task, &i2);
+        for (int j = 0; j < n2; j++) if (strstr(i2[j].path, leaf)) { injected = YES; break; }
+        if (i2) free(i2);
+        if (!injected && done == 0xC0FFEEULL) break;       // 回调已收尾但镜像没出现 ⇒ dlopen 失败
+    }
+    if (canarySeen == (uint64_t)canary) *executed = YES;
+    [log appendFormat:@"[frida] canary=%s pthread_create_from_mach_thread=返回 %u pthread_t=0x%llx dlopen=0x%llx 收尾=%@\n",
+                      *executed ? "✓ 代码页已执行" : "✗ 没出现",
+                      pthreadRc, slot, dlopenRc, done == 0xC0FFEEULL ? @"✓ 已完成" : @"✗ 未完成"];
+    if (!*executed)
+        [log appendString:@"[frida] ⚠️ 新线程压根没跑到代码页 ⇒ 与 dlopen 无关（看代码页/R+X 或 set_state）\n"];
+    else if (pthreadRc != 0)
+        [log appendFormat:@"[frida] ⚠️ pthread_create_from_mach_thread 返回 %u ⇒ 没造出 pthread\n", pthreadRc];
+    else if (!injected && done == 0xC0FFEEULL && dlopenRc == 0) {
+        [log appendString:@"[frida] dlopen 返回 0（失败）：路径不对 / 签名不被接受 / 依赖不可加载\n"];
+        uint64_t errPtr = 0;
+        if (vmRead(task, dataAddr + ODBG_D_DLERR_PTR, &errPtr, 8) && errPtr) {
+            char ebuf[512]; memset(ebuf, 0, sizeof(ebuf));
+            if (vmRead(task, errPtr, ebuf, sizeof(ebuf) - 1))
+                [log appendFormat:@"[frida] dyld 原话：%s\n", ebuf];
+        } else {
+            [log appendString:@"[frida] （dyld 没给出错误文本）\n"];
+        }
+    }
+    // ★ 绝不能 thread_terminate 目标里的线程：真机实测会让本 daemon 被内核当场杀掉（EXC_GUARD）
+    mach_port_deallocate(mach_task_self(), th);
+    if (injected) {
+        [log appendString:@"[frida] 注入成功（pthread_create_from_mach_thread 法，无需等用户态窗口）✅\n"];
+        return KERN_SUCCESS;
+    }
+    return KERN_FAILURE;
+}
+
+/// ★★ 「直接调目标自己的 dlopen」法（真机实测：匿名 R+X 代码页取指必被杀，此法不用代码页）：
+///   thread_create 出裸线程后，x0..x7 完全由我们掌控 ⇒ 直接把 PC 设成目标镜像里**已签名、已在跑**的
+///   dlopen（libdyld.dylib），x0 = 我们写进目标数据页的路径字符串，x1 = RTLD 标志，LR = 目标的 pause
+///   （dlopen 返回后停在那儿，不会落回 0）。整条链只调「目标已有的代码」，没有任何自造可执行页。
+///   与 frida 的区别：frida 会先造正规 pthread 再 dlopen（怕裸线程没有 TLS）；这里先直接试，
+///   成了就省掉整个 stub/pthread 阶段。风险：dlopen 或被加载库的初始化若碰线程 TLS，线程会崩
+///   （整个靶子进程一起死）⇒ 先在 !spawn 出来的牺牲进程上验证，别拿 SpringBoard 试。
+static kern_return_t remoteDlopenDirect(task_t task, odbg_image_t *imgs, int n, const char *path,
+                                       NSMutableString *log, BOOL *executed) {
+    *executed = NO;
+    uint64_t dlopenAddr = remoteSymbol(task, imgs, n, "libdyld.dylib", "dlopen");
+    uint64_t pauseAddr  = remoteSymbol(task, imgs, n, "libsystem_c.dylib", "pause");
+    if (!dlopenAddr || !pauseAddr) {
+        [log appendFormat:@"[direct] 远端符号缺失：dlopen=0x%llx pause=0x%llx\n", dlopenAddr, pauseAddr];
+        return KERN_FAILURE;
+    }
+    mach_vm_address_t dataAddr = 0;
+    kern_return_t kr = mach_vm_allocate(task, &dataAddr, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[direct] 路径页分配失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    size_t plen = strlen(path) + 1;
+    if (plen > 4000) plen = 4000;
+    kr = mach_vm_write(task, dataAddr, (vm_offset_t)path, (mach_msg_type_number_t)plen);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[direct] 写路径失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    mach_vm_address_t stack = 0;
+    kr = mach_vm_allocate(task, &stack, 0x40000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[direct] 栈分配失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    uint64_t stackTop = ((uint64_t)stack + 0x40000 - 16) & ~0xFULL;
+
+    thread_act_t th = MACH_PORT_NULL;
+    kr = thread_create(task, &th);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[direct] thread_create 失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    arm_thread_state64_t ts; memset(&ts, 0, sizeof(ts));
+#if __has_feature(ptrauth_calls)
+    __darwin_arm_thread_state64_set_pc_fptr(ts, odbgPreSignedPC(dlopenAddr));
+    __darwin_arm_thread_state64_set_lr_fptr(ts, odbgPreSignedLR(pauseAddr));
+    __darwin_arm_thread_state64_set_sp(ts, (void *)(uintptr_t)stackTop);
+#else
+    ts.__pc = dlopenAddr; ts.__lr = pauseAddr; ts.__sp = stackTop;
+#endif
+    ts.__x[0] = (uint64_t)dataAddr;      // dlopen 的第 1 参：路径
+    ts.__x[1] = 3;                       // dlopen 的第 2 参：RTLD_LAZY|RTLD_NOW
+    kern_return_t sk = thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
+    if (sk != KERN_SUCCESS) {
+        [log appendFormat:@"[direct] thread_set_state 失败：%s\n", mach_error_string(sk)];
+        thread_terminate(th);
+        mach_port_deallocate(mach_task_self(), th);
+        return KERN_FAILURE;
+    }
+    thread_resume(th);
+    [log appendFormat:@"[direct] PC=dlopen@0x%llx x0=0x%llx(\"%s\") x1=3 LR=pause@0x%llx SP=0x%llx\n",
+                      dlopenAddr, (uint64_t)dataAddr, path, pauseAddr, stackTop];
+
+    const char *leaf = strrchr(path, '/');
+    leaf = leaf ? leaf + 1 : path;
+    BOOL injected = NO;
+    for (int k = 0; k < 120 && !injected; k++) {
+        usleep(100 * 1000);
+        odbg_image_t *i2 = NULL;
+        int n2 = remoteImages(task, &i2);
+        for (int j = 0; j < n2; j++) if (strstr(i2[j].path, leaf)) { injected = YES; break; }
+        if (i2) free(i2);
+        if (!injected && (k == 20 || k == 60)) {       // 诊断：2 秒 / 6 秒时看一眼线程 PC（LR 在 pause 里=已返回）
+            arm_thread_state64_t cur; memset(&cur, 0, sizeof(cur));
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t gk = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&cur, &sc);
+            if (gk == KERN_SUCCESS) {
+                uint64_t pc = odbgStatePC(&cur);
+                BOOL parked = odbgParkedInPause(&cur, pauseAddr);
+                [log appendFormat:@"[direct] %d ms 后线程 PC=0x%llx LR=0x%llx（dlopen=0x%llx pause=0x%llx %@）\n",
+                                  (k + 1) * 100, pc,
+                                  (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(cur),
+                                  dlopenAddr, pauseAddr,
+                                  (parked ? @"LR 在 pause 里 ⇒ dlopen 已返回" : @"还没返回 ⇒ dlopen 里/线程已死")];
+            } else {
+                [log appendFormat:@"[direct] %d ms 后 thread_get_state=%s ⇒ 线程已死（多半 TLS/异常）\n",
+                                  (k + 1) * 100, mach_error_string(gk)];
+                break;
+            }
+        }
+    }
+    if (injected) {
+        *executed = YES;
+        [log appendString:@"[direct] 注入成功（新线程直接调目标自己的 dlopen）✅\n"];
+    } else {
+        [log appendString:@"[direct] ❌ 镜像表里没出现该 dylib\n"];
+    }
+    // 不能对 target 里的新线程调 thread_terminate：实测 daemon 会被内核直接杀掉（见 !call 注释）
+    mach_port_deallocate(mach_task_self(), th);
+    return injected ? KERN_SUCCESS : KERN_FAILURE;
+}
+
+#pragma mark - 诊断：新线程直调目标里的任意符号（!call）
+/// 在目标进程分配一页并写入字符串，返回远端地址（失败返回 0）
+static uint64_t remoteWriteString(task_t task, const char *str, NSString **err) {
+    mach_vm_address_t addr = 0;
+    kern_return_t kr = mach_vm_allocate(task, &addr, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        if (err) *err = [NSString stringWithFormat:@"分配字符串页失败：%s", mach_error_string(kr)];
+        return 0;
+    }
+    size_t len = strlen(str) + 1;
+    if (len > 4000) len = 4000;
+    kr = mach_vm_write(task, addr, (vm_offset_t)str, (mach_msg_type_number_t)len);
+    if (kr != KERN_SUCCESS) {
+        if (err) *err = [NSString stringWithFormat:@"写字符串失败：%s", mach_error_string(kr)];
+        return 0;
+    }
+    return (uint64_t)addr;
+}
+
+/// 在目标进程造一个新线程：PC/LR 按 PAC 约定签名，x0/x1 由调用者给定，SP 用新分配的栈
+static kern_return_t remoteNewThread2(task_t task, uint64_t pcAddr, uint64_t lrAddr,
+                                      uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                                      uint64_t *stackTopOut, thread_act_t *outTh, NSString **err) {
+    mach_vm_address_t stack = 0;
+    kern_return_t kr = mach_vm_allocate(task, &stack, 0x40000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        if (err) *err = [NSString stringWithFormat:@"分配栈失败：%s", mach_error_string(kr)];
+        return kr;
+    }
+    uint64_t stackTop = ((uint64_t)stack + 0x40000 - 16) & ~0xFULL;
+    thread_act_t th = MACH_PORT_NULL;
+    kr = thread_create(task, &th);
+    if (kr != KERN_SUCCESS) {
+        if (err) *err = [NSString stringWithFormat:@"thread_create 失败：%s", mach_error_string(kr)];
+        return kr;
+    }
+    arm_thread_state64_t ts; memset(&ts, 0, sizeof(ts));
+#if __has_feature(ptrauth_calls)
+    __darwin_arm_thread_state64_set_pc_fptr(ts, odbgPreSignedPC(pcAddr));
+    __darwin_arm_thread_state64_set_lr_fptr(ts, odbgPreSignedLR(lrAddr));
+    __darwin_arm_thread_state64_set_sp(ts, (void *)(uintptr_t)stackTop);
+#else
+    ts.__pc = pcAddr; ts.__lr = lrAddr; ts.__sp = stackTop;
+#endif
+    ts.__x[0] = x0;
+    ts.__x[1] = x1;
+    ts.__x[2] = x2;
+    ts.__x[3] = x3;
+    kr = thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
+    if (kr != KERN_SUCCESS) {
+        if (err) *err = [NSString stringWithFormat:@"thread_set_state 失败：%s", mach_error_string(kr)];
+        thread_terminate(th);
+        mach_port_deallocate(mach_task_self(), th);
+        return kr;
+    }
+    thread_resume(th);
+    if (stackTopOut) *stackTopOut = stackTop;
+    *outTh = th;
+    return KERN_SUCCESS;
+}
+
+static kern_return_t remoteNewThread(task_t task, uint64_t pcAddr, uint64_t lrAddr,
+                                     uint64_t x0, uint64_t x1, uint64_t *stackTopOut,
+                                     thread_act_t *outTh, NSString **err) {
+    return remoteNewThread2(task, pcAddr, lrAddr, x0, x1, 0, 0, stackTopOut, outTh, err);
+}
+
+/// 「返回值落到 pause」的判定：线程跑完我们的调用后停在 pause 内部时，PC 落在 libsystem_kernel 的
+/// 系统调用桩上（不在 pause 自己那段），只有 LR 还在 pause 体内（实测 LR = pause+0x2C）⇒ 用 LR 判断。
+static BOOL odbgParkedInPause(arm_thread_state64_t *st, uint64_t pauseAddr) {
+    uint64_t lr = (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(*st);
+    return (lr >= pauseAddr && lr < pauseAddr + 0x400);
+}
+
+static uint64_t odbgStatePC(arm_thread_state64_t *st) {
+#if __has_feature(ptrauth_calls) && defined(__LP64__)
+    return (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_pc(*st);   // 官方访问器，跨进程 PAC 也能还原
+#else
+    return (uint64_t)(uintptr_t)st->__pc;
+#endif
+}
+
+/// ★★ 「借目标自己的 pthread_create + 目标自己的 dlopen」法（完全不写代码页，也不需要用户态窗口）：
+///   裸线程（寄存器齐全）调 pthread_create(&slot, NULL, dlopen, 路径) —— 新线程是**正规 pthread**（libpthread
+///   会建好 TLS、栈、pthread_t），它调用 dlopen(路径, x1 残留值)；dlopen 返回后 pthread 正常退出。
+///   风险：_pthread_start 调 start_routine 时只保证 x0=参数，x1（dlopen 的 mode）是残留值 ⇒ 可能被当成 RTLD_NOLOAD。
+static kern_return_t remoteDlopenPthread(task_t task, odbg_image_t *imgs, int n, const char *path,
+                                         NSMutableString *log, BOOL *executed) {
+    *executed = NO;
+    uint64_t pcreate = remoteSymbol(task, imgs, n, "libsystem_pthread.dylib", "pthread_create");
+    uint64_t dlopenAddr = remoteSymbol(task, imgs, n, "libdyld.dylib", "dlopen");
+    uint64_t pauseAddr  = remoteSymbol(task, imgs, n, "libsystem_c.dylib", "pause");
+    if (!pcreate || !dlopenAddr || !pauseAddr) {
+        [log appendFormat:@"[pth] 远端符号缺失：pthread_create=0x%llx dlopen=0x%llx pause=0x%llx\n",
+                          pcreate, dlopenAddr, pauseAddr];
+        return KERN_FAILURE;
+    }
+    mach_vm_address_t data = 0;
+    kern_return_t kr = mach_vm_allocate(task, &data, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[pth] 数据页分配失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    size_t plen = strlen(path) + 1;
+    if (plen > 3000) plen = 3000;
+    kr = mach_vm_write(task, data, (vm_offset_t)path, (mach_msg_type_number_t)plen);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[pth] 写路径失败：%s\n", mach_error_string(kr)];
+        return kr;
+    }
+    uint64_t zero = 0;
+    mach_vm_write(task, data + 0x1000 - 16, (vm_offset_t)&zero, (mach_msg_type_number_t)sizeof(zero));
+    uint64_t slotAddr = data + 0x1000 - 16;           // pthread_t 输出槽
+
+    thread_act_t th = MACH_PORT_NULL;
+    uint64_t stackTop = 0;
+    NSString *err = nil;
+    kr = remoteNewThread2(task, pcreate, pauseAddr, slotAddr, 0, dlopenAddr, (uint64_t)data,
+                          &stackTop, &th, &err);
+    if (kr != KERN_SUCCESS) {
+        [log appendFormat:@"[pth] %@\n", err];
+        return kr;
+    }
+    [log appendFormat:@"[pth] 裸线程 PC=pthread_create@0x%llx x0=&slot(0x%llx) x1=0 x2=dlopen@0x%llx "
+                      @"x3=路径(0x%llx) LR=pause@0x%llx SP=0x%llx\n",
+                      pcreate, slotAddr, dlopenAddr, (uint64_t)data, pauseAddr, stackTop];
+
+    const char *leaf = strrchr(path, '/');
+    leaf = leaf ? leaf + 1 : path;
+    BOOL injected = NO;
+    for (int k = 0; k < 120 && !injected; k++) {
+        usleep(100 * 1000);
+        odbg_image_t *i2 = NULL;
+        int n2 = remoteImages(task, &i2);
+        for (int j = 0; j < n2; j++) if (strstr(i2[j].path, leaf)) { injected = YES; break; }
+        if (i2) free(i2);
+        if (!injected && (k == 4 || k == 19 || k == 59)) {
+            uint64_t slotVal = 0;
+            BOOL slotOK = vmRead(task, slotAddr, &slotVal, sizeof(slotVal));
+            arm_thread_state64_t cur; memset(&cur, 0, sizeof(cur));
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t gk = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&cur, &sc);
+            [log appendFormat:@"[pth] %d ms：pthread_t 槽=0x%llx(%@) 裸线程 %@\n",
+                              (k + 1) * 100, slotVal, (slotOK && slotVal) ? @"已创建 ⇒ pthread_create 跑通" : @"还是 0",
+                              gk == KERN_SUCCESS
+                                ? [NSString stringWithFormat:@"活着 PC=0x%llx LR=0x%llx", odbgStatePC(&cur),
+                                     (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(cur)]
+                                : [NSString stringWithFormat:@"已死(%s)", mach_error_string(gk)]];
+        }
+    }
+    if (injected) {
+        *executed = YES;
+        [log appendString:@"[pth] ✅ 注入成功（裸线程 → 目标的 pthread_create → 目标的 dlopen）\n"];
+    } else {
+        [log appendString:@"[pth] ❌ 镜像表里没出现该 dylib\n"];
+    }
+    mach_port_deallocate(mach_task_self(), th);
+    return injected ? KERN_SUCCESS : KERN_FAILURE;
+}
+
+static kern_return_t remoteDlopenHijack(task_t task, const char *path, NSString **detail) {
     kern_return_t kr = KERN_FAILURE;
     NSMutableString *log = [NSMutableString string];
     odbg_image_t *imgs = NULL;
@@ -716,6 +1251,429 @@ static kern_return_t remoteDlopen(task_t task, const char *path, NSString **deta
     else { kr = KERN_FAILURE; [log appendString:@"❌ 所有线程都没跑起来\n"]; }
     *detail = log;
     return kr;
+}
+
+/// 注入 dylib 的统一入口：先试 frida 式（新线程，立刻能起），只有「代码页压根没执行过」才退回劫持法。
+/// 之所以加这道闸：frida 路径失败但代码页执行过 ⇒ dlopen 本身也救不回来，退回劫持法只会白等几十秒。
+static kern_return_t remoteDlopen(task_t task, const char *path, NSString **detail) {
+    NSMutableString *log = [NSMutableString string];
+    odbg_image_t *imgs = NULL;
+    int n = remoteImages(task, &imgs);
+    if (n <= 0) { *detail = @"读不到远端镜像表（remoteImages 失败）"; if (imgs) free(imgs); return KERN_FAILURE; }
+    const char *leaf = strrchr(path, '/');
+    leaf = leaf ? leaf + 1 : path;
+    for (int i = 0; i < n; i++)
+        if (strstr(imgs[i].path, leaf)) {
+            [log appendFormat:@"该 dylib 已在镜像表里（%@），无需注入\n", @(imgs[i].path)];
+            *detail = log; free(imgs);
+            return KERN_SUCCESS;
+        }
+    // ① frida 式：新线程 + R+X 代码页 + stub 里 pthread_create（不等用户态窗口）
+    BOOL executed = NO;
+    kern_return_t kr = remoteDlopenFrida(task, imgs, n, path, log, &executed);
+    free(imgs);
+    if (kr == KERN_SUCCESS) { *detail = log; return KERN_SUCCESS; }
+    if (executed) {
+        [log appendString:@"代码页已经执行过 ⇒ 问题在 stub/dlopen 本身，不再退回劫持法\n"];
+        *detail = log;
+        return KERN_FAILURE;
+    }
+    [log appendString:@"—— 退回劫持法（把已有线程的 PC 换成 dlopen、LR 停 pause）——\n"];
+    NSString *d2 = nil;
+    kern_return_t kr2 = remoteDlopenHijack(task, path, &d2);
+    if (d2) [log appendFormat:@"%@\n", d2];
+    *detail = log;
+    return kr2;
+}
+
+/// !fd <pid|springboard|self> <dylib 路径>：只走 frida 式注入（新线程 + R+X 代码页），
+/// 不退回劫持法。专给「牺牲进程」做验证用：万一代码页取指被判死，崩的只是靶子进程。
+static NSString *cmdFridaDlopen(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    if (parts.count < 2) return @"用法: !fd <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *who = parts[0];
+    pid_t pid = [who.lowercaseString hasPrefix:@"spring"] ? pidOfName("SpringBoard")
+              : ([who.lowercaseString isEqualToString:@"self"] ? getpid() : (pid_t)atoi(who.UTF8String));
+    if (pid <= 0) return @"用法: !fd <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *path = [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@" "];
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"task_for_pid(%d) 失败: %s\n", pid, mach_error_string(kr)];
+    odbg_image_t *imgs = NULL;
+    int n = remoteImages(task, &imgs);
+    NSMutableString *log = [NSMutableString stringWithFormat:@"目标 pid=%d 路径=%@ 镜像数=%d\n", pid, path, n];
+    BOOL executed = NO;
+    kr = remoteDlopenFrida(task, imgs, n, path.UTF8String, log, &executed);
+    if (imgs) free(imgs);
+    mach_port_deallocate(mach_task_self(), task);
+    [log appendFormat:@"结果：%@（代码页执行过=%d）\n", kr == KERN_SUCCESS ? @"成功 ✅" : @"失败 ❌", (int)executed];
+    return log;
+}
+
+/// !dld <pid|springboard|self> <dylib 路径>：只走「新线程直接 PC=目标的 dlopen」法，不写任何代码页、
+/// 不退回劫持法。牺牲进程验证首选。
+static NSString *cmdDirectDlopen(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    if (parts.count < 2) return @"用法: !dld <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *who = parts[0];
+    pid_t pid = [who.lowercaseString hasPrefix:@"spring"] ? pidOfName("SpringBoard")
+              : ([who.lowercaseString isEqualToString:@"self"] ? getpid() : (pid_t)atoi(who.UTF8String));
+    if (pid <= 0) return @"用法: !dld <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *path = [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@" "];
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"task_for_pid(%d) 失败: %s\n", pid, mach_error_string(kr)];
+    odbg_image_t *imgs = NULL;
+    int n = remoteImages(task, &imgs);
+    NSMutableString *log = [NSMutableString stringWithFormat:@"目标 pid=%d 路径=%@ 镜像数=%d\n", pid, path, n];
+    BOOL executed = NO;
+    kr = remoteDlopenDirect(task, imgs, n, path.UTF8String, log, &executed);
+    if (imgs) free(imgs);
+    mach_port_deallocate(mach_task_self(), task);
+    [log appendFormat:@"结果：%@\n", kr == KERN_SUCCESS ? @"成功 ✅" : @"失败 ❌"];
+    return log;
+}
+
+/// !call <pid|springboard|self> <镜像名> <符号> [x0 十六进制|str:文本] [x1 十六进制]
+/// 诊断用：新线程 + PC=目标镜像里解析出的符号 + LR=目标的 pause + x0/x1 可控；
+/// 轮询 thread_get_state 看线程死没死、PC 有没有落在 pause ⇒ 判定「新线程 + set_state + PAC 签名」这套机制本身是否成立。
+static NSString *cmdCall(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    if (parts.count < 3) return @"用法: !call <pid|springboard|self> <镜像名> <符号> [x0 十六进制|str:文本] [x1 十六进制]\n";
+    NSString *who = parts[0];
+    pid_t pid = [who.lowercaseString hasPrefix:@"spring"] ? pidOfName("SpringBoard")
+              : ([who.lowercaseString isEqualToString:@"self"] ? getpid() : (pid_t)atoi(who.UTF8String));
+    if (pid <= 0) return @"用法: !call <pid|springboard|self> <镜像名> <符号> [x0 十六进制|str:文本] [x1 十六进制]\n";
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"task_for_pid(%d) 失败: %s\n", pid, mach_error_string(kr)];
+    odbg_image_t *imgs = NULL;
+    int n = remoteImages(task, &imgs);
+    uint64_t pc = remoteSymbol(task, imgs, n, parts[1].UTF8String, parts[2].UTF8String);
+    uint64_t pauseAddr = remoteSymbol(task, imgs, n, "libsystem_c.dylib", "pause");
+    if (imgs) free(imgs);
+    NSMutableString *out = [NSMutableString stringWithFormat:@"pid=%d %@!%@ => PC=0x%llx LR=pause@0x%llx\n",
+                             pid, parts[1], parts[2], pc, pauseAddr];
+    if (!pc || !pauseAddr) {
+        mach_port_deallocate(mach_task_self(), task);
+        [out appendString:@"❌ 远端符号解析失败（镜像名/符号名拼写？）\n"];
+        return out;
+    }
+    NSString *err = nil;
+    uint64_t x0 = 0, x1 = 0;
+    if (parts.count > 3) {
+        NSString *a0 = parts[3];
+        if ([a0 hasPrefix:@"str:"]) {
+            NSString *text = [[parts subarrayWithRange:NSMakeRange(3, parts.count - 3)] componentsJoinedByString:@" "];
+            text = [text substringFromIndex:4];
+            x0 = remoteWriteString(task, text.UTF8String, &err);
+            if (!x0) {
+                mach_port_deallocate(mach_task_self(), task);
+                [out appendFormat:@"❌ %@\n", err];
+                return out;
+            }
+            [out appendFormat:@"字符串(0x%llx)=\"%@\"\n", x0, text];
+        } else {
+            x0 = strtoull(a0.UTF8String, NULL, 16);
+        }
+    }
+    if (parts.count > 4 && ![parts[3] hasPrefix:@"str:"]) x1 = strtoull(parts[4].UTF8String, NULL, 16);
+    [out appendFormat:@"x0=0x%llx x1=0x%llx\n", x0, x1];
+    applog(@"[call] 符号解析完成 pc=0x%llx pause=0x%llx x0=0x%llx x1=0x%llx", pc, pauseAddr, x0, x1);
+
+    thread_act_t th = MACH_PORT_NULL;
+    uint64_t stackTop = 0;
+    kr = remoteNewThread(task, pc, pauseAddr, x0, x1, &stackTop, &th, &err);
+    if (kr != KERN_SUCCESS) {
+        mach_port_deallocate(mach_task_self(), task);
+        [out appendFormat:@"❌ %@\n", err];
+        return out;
+    }
+    [out appendFormat:@"已起新线程 SP=0x%llx，开始轮询：\n", stackTop];
+    applog(@"[call] 线程已起 th=0x%x sp=0x%llx", th, stackTop);
+    BOOL parked = NO, dead = NO;
+    for (int k = 0; k < 30; k++) {                  // 最多 3 秒
+        usleep(100 * 1000);
+        arm_thread_state64_t cur; memset(&cur, 0, sizeof(cur));
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        kern_return_t gk = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&cur, &sc);
+        if (gk != KERN_SUCCESS) {
+            [out appendFormat:@"%4d ms: thread_get_state=%s(%d) ⇒ 线程已死 ❌\n",
+                              (k + 1) * 100, mach_error_string(gk), gk];
+            dead = YES;
+            break;
+        }
+        uint64_t nowPC = odbgStatePC(&cur);
+        if (k == 0) {
+            applog(@"[call] 第 1 轮 x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx sp=0x%llx lr=0x%llx pc=0x%llx",
+                   (uint64_t)cur.__x[0], (uint64_t)cur.__x[1], (uint64_t)cur.__x[2], (uint64_t)cur.__x[3],
+                   (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_sp(cur),
+                   (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(cur), nowPC);
+            [out appendFormat:@"寄存器 x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx sp=0x%llx lr=0x%llx\n",
+                              (uint64_t)cur.__x[0], (uint64_t)cur.__x[1], (uint64_t)cur.__x[2], (uint64_t)cur.__x[3],
+                              (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_sp(cur),
+                              (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(cur)];
+        }
+        thread_basic_info_data_t tbi; memset(&tbi, 0, sizeof(tbi));
+        mach_msg_type_number_t tic = THREAD_BASIC_INFO_COUNT;
+        kern_return_t ik = thread_info(th, THREAD_BASIC_INFO, (thread_info_t)&tbi, &tic);
+        BOOL atPause = odbgParkedInPause(&cur, pauseAddr);
+        if (k == 0 || k == 4 || k == 9 || k == 19 || atPause) {
+            [out appendFormat:@"%4d ms: 线程活着 PC=0x%llx LR=0x%llx run_state=%d %@\n",
+                              (k + 1) * 100, nowPC,
+                              (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr(cur),
+                              ik == KERN_SUCCESS ? tbi.run_state : -1,
+                              atPause ? @"✅ 已返回并停在 pause" : @""];
+            applog(@"[call] %d ms 线程活着 pc=0x%llx run_state=%d atPause=%d", (k + 1) * 100, nowPC,
+                   ik == KERN_SUCCESS ? tbi.run_state : -1, atPause ? 1 : 0);
+        }
+        if (atPause) { parked = YES; break; }
+    }
+    applog(@"[call] 轮询结束 dead=%d parked=%d", dead, parked);
+    [out appendFormat:@"诊断结论：%@\n", dead ? @"线程崩溃（机制或 PAC 签名有问题，或是被调函数自身崩）❌"
+                                       : (parked ? @"新线程 + set_state + PAC 签名 + 返回 pause 全部成立 ✅"
+                                                 : @"线程还活着但没停在 pause（还在被调函数里）⚠️")];
+    // 真机实测（1.0.123）：对这张新线程 port 调 thread_terminate 后 odebugd 立刻被内核杀掉
+    // （日志里没有 💥 信号回溯、只有下一次启动横幅 ⇒ 不可捕获的 SIGKILL，多半是 EXC_GUARD）
+    // ⇒ 不 terminate、也不回收线程 port：线程自己停在目标的 pause 里，随目标进程一起消失。
+    mach_port_deallocate(mach_task_self(), task);
+    applog(@"[call] 全部完成");
+    return out;
+}
+
+/// !pth <pid|springboard|self> <dylib 路径>：只走「借目标 pthread_create + 目标 dlopen」法，不写代码页、不回退。
+static NSString *cmdPthreadDlopen(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    if (parts.count < 2) return @"用法: !pth <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *who = parts[0];
+    pid_t pid = [who.lowercaseString hasPrefix:@"spring"] ? pidOfName("SpringBoard")
+              : ([who.lowercaseString isEqualToString:@"self"] ? getpid() : (pid_t)atoi(who.UTF8String));
+    if (pid <= 0) return @"用法: !pth <pid|springboard|self> <dylib 绝对路径>\n";
+    NSString *path = [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@" "];
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"task_for_pid(%d) 失败: %s\n", pid, mach_error_string(kr)];
+    odbg_image_t *imgs = NULL;
+    int n = remoteImages(task, &imgs);
+    NSMutableString *log = [NSMutableString stringWithFormat:@"目标 pid=%d 路径=%@ 镜像数=%d\n", pid, path, n];
+    BOOL executed = NO;
+    kr = remoteDlopenPthread(task, imgs, n, path.UTF8String, log, &executed);
+    if (imgs) free(imgs);
+    mach_port_deallocate(mach_task_self(), task);
+    applog(@"[pth] 收尾 kr=%d executed=%d", kr, executed);
+    [log appendFormat:@"结果：%@\n", kr == KERN_SUCCESS ? @"成功 ✅" : @"失败 ❌"];
+    return log;
+}
+
+/// !rx <pid|springboard|self> [self|target|payload|addimm|fdbug]：判定「目标能不能执行我们自己的代码页」。
+/// 极小 stub = 往数据页写 canary 然后原地自旋（0x14000000 = b .）；造裸线程跑它 ⇒ 看 canary 出不出来。
+///   self   先在 daemon 自己这边把 scratch 页翻成 R|X，再 mach_vm_remap 进目标（frida 的做法）
+///   target 直接在目标里分配页、写码、翻 R|X（!fd 原来的做法）
+static NSString *cmdRxTest(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    NSString *who = parts.count > 0 ? (NSString *)parts[0] : @"";
+    if (who.length == 0) return @"用法: !rx <pid|springboard|self> [self|target|payload|addimm|fdbug]\n";
+    NSString *mode = parts.count > 1 ? ((NSString *)parts[1]).lowercaseString : @"self";
+    pid_t pid = [who.lowercaseString hasPrefix:@"spring"] ? pidOfName("SpringBoard")
+              : ([who.lowercaseString isEqualToString:@"self"] ? getpid() : (pid_t)atoi(who.UTF8String));
+    if (pid <= 0) return @"用法: !rx <pid|springboard|self> [self|target|payload|addimm|fdbug]\n";
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"task_for_pid(%d) 失败: %s\n", pid, mach_error_string(kr)];
+    NSMutableString *out = [NSMutableString stringWithFormat:@"pid=%d 模式=%@\n", pid, mode];
+    const uint32_t canary = 0x0DB60002u;
+    mach_vm_address_t dataAddr = 0;
+    kr = mach_vm_allocate(task, &dataAddr, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), task); return @"数据页分配失败\n"; }
+    uint64_t zero = 0;
+    mach_vm_write(task, dataAddr, (vm_offset_t)&zero, sizeof(zero));
+    mach_vm_address_t dst = 0;
+    kr = mach_vm_allocate(task, &dst, 0x4000, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), task); return @"目标代码页占位分配失败\n"; }
+    odbg_image_t *imgs = NULL; int n = remoteImages(task, &imgs);
+    uint64_t pauseAddr = remoteSymbol(task, imgs, n, "libsystem_c.dylib", "pause");
+    if (imgs) free(imgs);
+    if (!pauseAddr) {   // ★ 靶子刚起来时 dyld 镜像表可能还没就绪（remoteImages 拿到 0 张）⇒ 别拿地址 0 去造线程
+        mach_port_deallocate(mach_task_self(), task);
+        return [NSString stringWithFormat:@"%@（镜像数=%d）：符号解析失败、靶子镜像表可能还没就绪，等 2 秒再来一次\n",
+                                          @"pause 解析失败", n];
+    }
+    // ★ 模式 payload：完全复刻 remoteDlopenFrida 的布局（一次大分配，code/data/stack 同处一块），
+    //   但 stub 只做「写两个 canary 然后原地自旋」⇒ 用来分辨「布局/thread_create 有问题」还是「stub 里的调用有问题」。
+    if ([mode isEqualToString:@"payload"]) {
+        mach_vm_address_t base = 0;
+        kr = mach_vm_allocate(task, &base, ODBG_PAYLOAD_SIZE, VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), task); return @"payload 分配失败\n"; }
+        uint64_t cAddr = (uint64_t)base + ODBG_PAYLOAD_CODE_OFF;
+        uint64_t dAddr = (uint64_t)base + ODBG_PAYLOAD_DATA_OFF;
+        uint64_t sTop  = (uint64_t)base + ODBG_PAYLOAD_STACK_OFF + ODBG_PAYLOAD_STACK_SIZE - 16;
+        uint32_t c2[64]; int n2 = 0;
+        emitMov64(c2, &n2, 19, dAddr);
+        emitMov64(c2, &n2, 0, (uint64_t)canary);
+        emitStr64(c2, &n2, 0, 19);                     // data+0 = canary（已验证过的写法）
+        emitAddImm(c2, &n2, 1, 19, 16);                // ★ 顺便验证 emitAddImm 本身
+        emitMov64(c2, &n2, 0, (uint64_t)(canary + 1));
+        emitStr64(c2, &n2, 0, 1);                      // data+16 = canary+1
+        emitInsn(c2, &n2, 0x14000000u);                // b .
+        uint8_t dpage[ODBG_DATA_BYTES]; memset(dpage, 0, sizeof(dpage));
+        mach_vm_write(task, dAddr, (vm_offset_t)dpage, (mach_msg_type_number_t)sizeof(dpage));
+        mach_vm_write(task, cAddr, (vm_offset_t)c2, (mach_msg_type_number_t)(n2 * 4));
+        kern_return_t pk = mach_vm_protect(task, cAddr, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        thread_act_t th = MACH_PORT_NULL;
+        kern_return_t ck = thread_create(task, &th);
+        kern_return_t sk = KERN_FAILURE;
+        if (ck == KERN_SUCCESS) {
+            arm_thread_state64_t ts; memset(&ts, 0, sizeof(ts));
+#if __has_feature(ptrauth_calls)
+            __darwin_arm_thread_state64_set_pc_fptr(ts, odbgPreSignedPC(cAddr));
+            __darwin_arm_thread_state64_set_lr_fptr(ts, odbgPreSignedLR(pauseAddr));
+            __darwin_arm_thread_state64_set_sp(ts, (void *)(uintptr_t)sTop);
+#else
+            ts.__pc = cAddr; ts.__lr = pauseAddr; ts.__sp = sTop;
+#endif
+            sk = thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
+            thread_resume(th);
+        }
+        [out appendFormat:@"payload 模式 base=0x%llx code=0x%llx data=0x%llx 栈顶=0x%llx protect(R|X)=%s "
+                          @"thread_create=%s set_state=%s\n",
+                          (uint64_t)base, cAddr, dAddr, sTop, mach_error_string(pk),
+                          mach_error_string(ck), mach_error_string(sk)];
+        for (int k = 0; k < 60; k++) {
+            if (k) usleep(5000);
+            uint32_t v0 = 0, v1 = 0;
+            BOOL ok0 = vmRead(task, dAddr, &v0, 4);
+            vmRead(task, dAddr + 16, &v1, 4);
+            if (!ok0) { [out appendFormat:@"❌ %d ms：数据页读不到（目标已死）；此前 v0=0x%x v1=0x%x\n", (k + 1) * 5, v0, v1]; break; }
+            if (v0 == canary) { [out appendFormat:@"✅ %d ms：v0=0x%x（data+0 写成功）v1=0x%x\n", (k + 1) * 5, v0, v1];
+                                if (v1 == canary + 1) [out appendString:@"✅ emitAddImm 也正确（data+16 命中）\n"];
+                                break; }
+        }
+        mach_port_deallocate(mach_task_self(), th);
+        mach_port_deallocate(mach_task_self(), task);
+        return out;
+    }
+    // ★ 模式 addimm：只换掉「已验证的 4 条指令 stub」里的一条 —— 用 emitAddImm+emitStr64 写第二、三个槽位，
+    //   用来判定 emitAddImm/emitStr64 的编码到底对不对（!rx target 那套已验证的构造，其余全不变）。
+    if ([mode isEqualToString:@"addimm"]) {
+        uint32_t c3[64]; int n3 = 0;
+        emitMov64(c3, &n3, 19, (uint64_t)dataAddr);
+        emitMov64(c3, &n3, 0, (uint64_t)canary);
+        emitAddImm(c3, &n3, 1, 19, 16); emitStr64(c3, &n3, 0, 1);       // data+16 = canary
+        emitMov64(c3, &n3, 0, (uint64_t)(canary + 1));
+        emitAddImm(c3, &n3, 1, 19, 32); emitStr64(c3, &n3, 0, 1);       // data+32 = canary+1
+        emitInsn(c3, &n3, 0x14000000u);                                 // b .
+        uint8_t dp[64]; memset(dp, 0, sizeof(dp));
+        mach_vm_write(task, dataAddr, (vm_offset_t)dp, 64);
+        mach_vm_write(task, dst, (vm_offset_t)c3, (mach_msg_type_number_t)(n3 * 4));
+        kr = mach_vm_protect(task, dst, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        [out appendFormat:@"addimm 模式 dst=0x%llx 写码 %d 字节、protect(R|X)=%s\n",
+                          (uint64_t)dst, n3 * 4, mach_error_string(kr)];
+        thread_act_t t3 = MACH_PORT_NULL; NSString *e3 = nil;
+        kr = remoteNewThread2(task, (uint64_t)dst, pauseAddr, 0, (uint64_t)dataAddr, 0, 0, NULL, &t3, &e3);
+        [out appendFormat:@"造线程 kr=%s %@\n", mach_error_string(kr), e3 ?: @""];
+        for (int k = 0; k < 20; k++) {
+            usleep(100 * 1000);
+            uint32_t w0 = 0, w1 = 0;
+            BOOL ok0 = vmRead(task, dataAddr + 16, &w0, 4);
+            vmRead(task, dataAddr + 32, &w1, 4);
+            if (!ok0) { [out appendFormat:@"❌ %d ms：读不到（目标已死）\n", (k + 1) * 100]; break; }
+            if (w0 == canary) { [out appendFormat:@"✅ %d ms：data+16=0x%x（emitAddImm+emitStr64 正确）data+32=0x%x\n",
+                                               (k + 1) * 100, w0, w1]; break; }
+        }
+        mach_port_deallocate(mach_task_self(), t3);
+        mach_port_deallocate(mach_task_self(), task);
+        return out;
+    }
+    // ★ 模式 fdbug：用 `!rx target` 已经验证过的构造（独立代码页/数据页 + remoteNewThread2 + LR=目标真实 pause）
+    //   去跑 `!fd` 的**整份 stub** ⇒ 分辨「stub 编码有问题」还是「!fd 那套构造/LR 有问题」。
+    if ([mode isEqualToString:@"fdbug"]) {
+        odbg_image_t *im2 = NULL; int n2 = remoteImages(task, &im2);
+        uint64_t dlopenAddr = remoteSymbol(task, im2, n2, "libdyld.dylib", "dlopen");
+        uint64_t pcfAddr    = remoteSymbol(task, im2, n2, "libsystem_pthread.dylib", "pthread_create_from_mach_thread");
+        uint64_t pexitAddr  = remoteSymbol(task, im2, n2, "libsystem_pthread.dylib", "pthread_exit");
+        [out appendFormat:@"符号 dlopen=0x%llx pcfmt=0x%llx pthread_exit=0x%llx pause=0x%llx\n",
+                          dlopenAddr, pcfAddr, pexitAddr, pauseAddr];
+        uint8_t dp[ODBG_DATA_BYTES]; memset(dp, 0, sizeof(dp));
+        const char *dpath = "/var/mobile/odbgprobe.dylib";
+        memcpy(dp + ODBG_D_PATH, dpath, strlen(dpath) + 1);
+        mach_vm_write(task, dataAddr, (vm_offset_t)dp, (mach_msg_type_number_t)sizeof(dp));
+        uint32_t c4[1024]; uint64_t rAddr = 0, pAddr = 0;
+        uint64_t derrAddr = 0;   // 同上：dlerror 会在目标的新线程上把进程打死，不调用
+        if (im2) free(im2);
+        int n4 = odbgBuildFridaStub(c4, (uint64_t)dst, (uint64_t)dataAddr, 0x0DB60001u, pcfAddr,
+                                    dlopenAddr, pexitAddr, derrAddr, pauseAddr, &rAddr, &pAddr);
+        mach_vm_write(task, dst, (vm_offset_t)c4, (mach_msg_type_number_t)(n4 * 4));
+        kr = mach_vm_protect(task, dst, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        [out appendFormat:@"fdbug 模式 dst=0x%llx 写码 %d 字节 routine=0x%llx park=0x%llx protect(R|X)=%s\n",
+                          (uint64_t)dst, n4 * 4, rAddr, pAddr, mach_error_string(kr)];
+        thread_act_t t4 = MACH_PORT_NULL; NSString *e4 = nil;
+        kr = remoteNewThread2(task, (uint64_t)dst, pauseAddr, 0, (uint64_t)dataAddr, 0, 0, NULL, &t4, &e4);
+        [out appendFormat:@"造线程（LR=真 pause）kr=%s %@\n", mach_error_string(kr), e4 ?: @""];
+        for (int k = 0; k < 30; k++) {
+            usleep(100 * 1000);
+            uint64_t cv = 0, dv = 0; uint32_t pv = 0;
+            BOOL ok = vmRead(task, (uint64_t)dataAddr + ODBG_D_ENTRY_HIT, &cv, 8);
+            vmRead(task, (uint64_t)dataAddr + ODBG_D_PTHREAD_RC, &pv, 4);
+            vmRead(task, (uint64_t)dataAddr + ODBG_D_DLOPEN_RC, &dv, 8);
+            if (!ok) { [out appendFormat:@"❌ %d ms：数据页读不到（目标已死）\n", (k + 1) * 100]; break; }
+            if (cv) { [out appendFormat:@"✅ %d ms：canary=0x%llx ⇒ 整份 stub 跑到过了（pthread rc=%u dlopen=0x%llx）\n",
+                                               (k + 1) * 100, cv, pv, dv];
+                      if (dv) [out appendString:@"✅ dlopen 成功 ⇒ frida 式注入成功\n"];
+                      break; }
+        }
+        mach_port_deallocate(mach_task_self(), t4);
+        mach_port_deallocate(mach_task_self(), task);
+        return out;
+    }
+    uint32_t code[256]; int cn = 0;
+    emitMov64(code, &cn, 19, (uint64_t)dataAddr);
+    emitMov64(code, &cn, 0, (uint64_t)canary);
+    emitStr64(code, &cn, 0, 19);
+    code[cn++] = 0x14000000u;                       // b .（原地自旋）
+    if ([mode isEqualToString:@"target"]) {
+        mach_vm_write(task, dst, (vm_offset_t)code, (mach_msg_type_number_t)(cn * 4));
+        kr = mach_vm_protect(task, dst, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        [out appendFormat:@"目标内建页 dst=0x%llx 写码 %d 字节、protect(R|X)=%s\n",
+                          (uint64_t)dst, cn * 4, mach_error_string(kr)];
+    } else {
+        mach_vm_address_t scratch = 0;
+        kr = mach_vm_allocate(mach_task_self(), &scratch, 0x4000, VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), task); return @"daemon scratch 分配失败\n"; }
+        mach_vm_write(mach_task_self(), scratch, (vm_offset_t)code, (mach_msg_type_number_t)(cn * 4));
+        kr = mach_vm_protect(mach_task_self(), scratch, 0x4000, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        [out appendFormat:@"daemon 自建 scratch=0x%llx 写码 %d 字节、protect(R|X)=%s\n",
+                          (uint64_t)scratch, cn * 4, mach_error_string(kr)];
+        vm_prot_t cur = 0, max = 0;
+        vm_address_t dstAddr = (vm_address_t)dst;
+        kr = vm_remap(task, &dstAddr, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)scratch,
+                      FALSE, &cur, &max, VM_INHERIT_COPY);
+        dst = (mach_vm_address_t)dstAddr;
+        [out appendFormat:@"vm_remap 进目标 dst=0x%llx kr=%s cur=%d max=%d\n",
+                          (uint64_t)dst, mach_error_string(kr), cur, max];
+        if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), task); return out; }
+    }
+    thread_act_t th = MACH_PORT_NULL; NSString *err = nil;
+    kr = remoteNewThread2(task, (uint64_t)dst, pauseAddr, 0, (uint64_t)dataAddr, 0, 0, NULL, &th, &err);
+    [out appendFormat:@"造裸线程 PC=0x%llx LR=pause@0x%llx：kr=%s %@\n",
+                      (uint64_t)dst, pauseAddr, mach_error_string(kr), err ?: @""];
+    for (int k = 0; k < 30; k++) {
+        usleep(100 * 1000);
+        uint32_t v = 0;
+        BOOL ok = vmRead(task, dataAddr, &v, sizeof(v));
+        if (!ok) { [out appendFormat:@"❌ %d ms：数据页读不到（目标可能已死）\n", (k + 1) * 100]; break; }
+        if (v == canary) { [out appendFormat:@"✅ %d ms：canary=0x%x 出现 ⇒ 目标执行了我们自己的代码页！\n", (k + 1) * 100, v]; break; }
+        if (k == 9 || k == 29) {
+            arm_thread_state64_t cur; memset(&cur, 0, sizeof(cur));
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            kern_return_t gk = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&cur, &sc);
+            [out appendFormat:@"%d ms：canary=0x%x 裸线程=%@\n", (k + 1) * 100, v,
+                              gk == KERN_SUCCESS ? [NSString stringWithFormat:@"活着 PC=0x%llx", odbgStatePC(&cur)]
+                                                 : [NSString stringWithFormat:@"已死(%s)", mach_error_string(gk)]];
+        }
+    }
+    mach_port_deallocate(mach_task_self(), th);
+    mach_port_deallocate(mach_task_self(), task);
+    return out;
 }
 
 static NSString *cmdImages(NSString *arg) {
@@ -1170,8 +2128,7 @@ static NSString *cmdInjectImpl(NSString *arg) {
     }
     if (pid <= 0) return [NSString stringWithFormat:@"❌ 找不到目标进程: %@\n", parts[0]];
 
-    NSString *dylib = parts.count > 1 ? parts[1]
-        : [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib"];
+    NSString *dylib = parts.count > 1 ? parts[1] : odbgDefaultPluginPath();
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:dylib]) {
         return [NSString stringWithFormat:@"❌ dylib 不存在: %@\n", dylib];
@@ -1244,6 +2201,11 @@ static NSString *helpText(void) {
         @"  !inject springboard 注入 ODebug.dylib 到 SpringBoard（自动先补 libellekit）\n"
         @"  !inject <pid>       注入到指定 pid\n"
         @"  !exec <pid>         远端 shellcode 执行探针（只写一个 flag，不加载任何库）\n"
+        @"  !fd <pid|springboard> <dylib>  frida 式注入（新线程 + R+X 代码页），不会退回劫持法\n"
+        @"  !dld <pid|springboard> <dylib> 新线程直接把 PC 设成目标的 dlopen（不写代码页），不回退\n"
+        @"  !call <pid|springboard> <镜像> <符号> [x0|str:文本] [x1]  新线程直调目标符号（诊断用）\n"
+        @"  !rx <pid|springboard> [self|target|payload|addimm|fdbug]  代码页取指试验（canary 自旋，判能不能执行匿名/remap 页）\n"
+        @"  !pth <pid|springboard> <dylib>  裸线程借目标的 pthread_create 让正规 pthread 去 dlopen（不写代码页）\n"
         @"  !win <pid|springboard> [秒]  只读采样：目标有没有「用户态运行窗口」（注入的前提）\n"
         @"  !hj <pid> write [文本]  劫持目标线程调 write(1,文本,n)，验证「劫持能不能生效」\n"
         @"  !hj <pid> open <路径>   劫持目标线程调 dlopen(路径,3)，验证「能不能把库装进去」\n"
@@ -1355,7 +2317,7 @@ static void *autoInjectThread(void *arg) {
             applog(@"[watchdog] SpringBoard(%d) 里没有 ODebug.dylib（多半是安全模式启动的）⇒ 自动兜底注入", sb);
             announced = sb;
         }
-        NSString *dylib = [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib"];
+        NSString *dylib = odbgDefaultPluginPath();
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:dylib]) { applog(@"[watchdog] ❌ 找不到 %@，跳过", dylib); continue; }
         NSString *r = cmdInject([NSString stringWithFormat:@"%d %@", sb, dylib]);
@@ -1389,7 +2351,7 @@ static NSString *cmdAuto(NSString *arg) {
     if ([a hasPrefix:@"off"]) { gAutoInject = 0; applog(@"[auto] 停用自动兜底"); return @"自动兜底注入已停用 ⛔（!auto on 可再开）\n"; }
     if ([a hasPrefix:@"run"]) {
         if (sb <= 0) return @"❌ 找不到 SpringBoard\n";
-        NSString *dylib = [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib"];
+        NSString *dylib = odbgDefaultPluginPath();
         return [NSString stringWithFormat:@"⚙️ 手动按兜底路径注入 SB(%d)…\n%@", sb,
                 cmdInject([NSString stringWithFormat:@"%d %@", sb, dylib])];
     }
@@ -1425,6 +2387,11 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!exec "]) return cmdExecProbe([cmd substringFromIndex:6]);
     if ([cmd hasPrefix:@"!win"]) return cmdWindowProbe([cmd substringFromIndex:4]);
     if ([cmd hasPrefix:@"!hj "]) return cmdHijack([cmd substringFromIndex:4]);
+    if ([cmd hasPrefix:@"!fd "]) return cmdFridaDlopen([cmd substringFromIndex:4]);
+    if ([cmd hasPrefix:@"!dld "]) return cmdDirectDlopen([cmd substringFromIndex:5]);
+    if ([cmd hasPrefix:@"!call "]) return cmdCall([cmd substringFromIndex:6]);
+    if ([cmd hasPrefix:@"!pth "]) return cmdPthreadDlopen([cmd substringFromIndex:5]);
+    if ([cmd hasPrefix:@"!rx "]) return cmdRxTest([cmd substringFromIndex:4]);
     if ([cmd hasPrefix:@"!spawn "]) return cmdSpawn([cmd substringFromIndex:7]);
     if ([cmd hasPrefix:@"!imgs"]) return cmdImages([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!sym "]) return cmdSym([cmd substringFromIndex:5]);

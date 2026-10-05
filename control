@@ -2,13 +2,16 @@ Package: com.tanyou.odebug
 Name: ODebug
 Depends: mobilesubstrate
 Architecture: iphoneos-arm64e
-Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322，安全模式下仍可用
+Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322（frida 式进程外注入器：安全模式/所有插件禁止注入时自动把插件注回 SpringBoard，4321 当场复活，无需 respring）
 Maintainer: tanyou
 Author: tanyou
 Section: Tweaks
-Version: 1.0.120
+Version: 1.0.141
 Changelog:
+ 1.0.141: 注入器按 frida-core（frida-helper-backend-glue.m）逐行复刻定型：裸 mach 线程 → pthread_create_from_mach_thread 建正规 pthread → 在该 pthread 上 dlopen；代码页 mach_vm_protect(R|X) 真机实测可执行（推翻 1.0.122 的旧结论）；参数按 frida 的 4 参约定。不再依赖「用户态窗口」，空闲/熄屏 SpringBoard 也能注入。修掉三个真机致命坑：注入线程上调 dlerror 会把目标打死（彻底不调用）、daemon 侧字节校验直接解引用 PAC 指针会 SIGSEGV 崩溃循环（改走 vmRead）、spawn 后立刻注入撞上 dyld 镜像表未就绪会 blr 0 打死目标（等 2 秒）。兜底 dylib 路径优先 <jbroot>/usr/lib/TweakInject/ODebug.dylib。真机端到端：!safe on 进安全模式（所有 tweak 禁止注入）后看门狗 5 秒内把 ODebug 注回 SpringBoard(47670)，iproxy 4321 当场应答，无需 respring。
  1.0.120: odebugd 增「安全模式自动兜底」看门狗（!auto status/on/off/run）：每 5 秒查 SpringBoard 有没有 ODebug.dylib，没有就自动注入 ⇒ 安全模式下无需 respring 即让 4321 控制台回来（新起的 SpringBoard 用户态线程多，实测第 0 轮即成功）；注入改为等「用户态窗口」并跳过落在 libsystem_kernel syscall 桩上的线程；主动 respring 不再被误判为崩溃循环；!safe status 改为直接读标记（不再用「控制台能应答 ⇒ 不是安全模式」反推）。
+ 1.0.122: 【该条结论已被 1.0.141 推翻，真因是 stub 里的 pthread_create + dyld 镜像表未就绪】真机实测匿名 R+X 代码页取指必被内核判死（新线程一跑，靶子进程当场被杀）⇒ 新增 !dld：新线程的 PC 直接设成目标镜像里已签名的 dlopen、x0=路径页、x1=RTLD、LR=pause，完全不写代码页。
+ 1.0.121: 注入器改写成 frida 式（新线程 + 「写 R/W 再翻 R+X」的代码页 + arm64 stub 里 paciza 签名后 pthread_create，再在 pthread 上 dlopen）：不再等「用户态窗口」，空闲 SpringBoard 也能注入；旧劫持法保留为兜底，只在代码页压根没执行过时才回退；新增 !fd <pid> <dylib> 试验命令（只走新路径、不回退，配合 !spawn 起牺牲进程验证）。
  1.0.119: 新增常驻调试服务 odebugd（LaunchDaemon/root/端口4322）：安全模式下插件内 4321 控制台必然消失，odebugd 从进程外工作 ⇒ 提供保命通道（!safe on / on all / off / respring / status）与 root 调试（!ps / !ls / !cat / !plist read / !sys / !log），并附 task_for_pid + 远程 VM + 远程线程的注入可行性探针 !tp <pid>。
  1.0.118: 安全模式进出（TANSafeMode）：标记路径改为 <jbroot>/var/mobile/.eksafemode（真机实测生效路径，写真实 /var/mobile/.eksafemode 无效）；控制台增 !safe on/off/status/respring；odebug.sh 增 frida 兜底通道、自动 iproxy 与 stdout 提示符修复；README 补双通道与端到端实测。
  1.0.117: 控制台/设置页/AltList 选取目标 App；TANHookAutoRestore 延迟到启动 6 秒。
