@@ -75,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.143";
+static NSString *gVersion = @"1.0.144";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2539,6 +2539,76 @@ static NSString *dispatchCommand(NSString *cmd) {
 
 #pragma mark - 令牌 / 连接
 
+/// 1.0.144：NSNetService 发布结果打日志（之前静默失败没法排查）
+@interface OdbgBonjourLogger : NSObject <NSNetServiceDelegate>
+@end
+@implementation OdbgBonjourLogger
+- (void)netServiceDidPublish:(NSNetService *)sender { applog(@"Bonjour 发布成功: %@%@:%d", sender.name, sender.type, sender.port); }
+- (void)netService:(NSNetService *)sender didNotPublish:(NSDictionary *)errorDict {
+    applog(@"⚠️ Bonjour 发布失败: %@（走 UDP 信标兜底）", errorDict);
+}
+@end
+
+/// 1.0.144：UDP 广播信标——不依赖 mDNSResponder/组播：每 5 秒向 255.255.255.255:4323
+/// 发一行 `ODEBUGD_BEACON <port> <版本>`，电脑端 odebug.sh 监听一次即可拿到手机 IP。
+static void *beaconThread(void *unused) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return NULL;
+    int bc = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &bc, sizeof(bc));
+    for (;;) {
+        // 信标里带上本机 IP（优选 WiFi en*，跳过蜂窝 pdp*/回环 lo*/隧道 utun*/awdl*）
+        char ipbuf[64] = "?";
+        struct ifaddrs *ifa = NULL;
+        if (getifaddrs(&ifa) == 0) {
+            char any[64] = "";
+            for (struct ifaddrs *f = ifa; f; f = f->ifa_next) {
+                if (!(f->ifa_addr && f->ifa_addr->sa_family == AF_INET)) continue;
+                const char *n = f->ifa_name ? f->ifa_name : "";
+                if (strncmp(n, "lo", 2) == 0 || strncmp(n, "pdp", 3) == 0 ||
+                    strncmp(n, "utun", 4) == 0 || strncmp(n, "awdl", 4) == 0 ||
+                    strncmp(n, "bridge", 6) == 0) continue;
+                char b[INET_ADDRSTRLEN] = {0};
+                inet_ntop(AF_INET, &((struct sockaddr_in *)f->ifa_addr)->sin_addr, b, sizeof(b));
+                if (strcmp(b, "127.0.0.1") == 0) continue;
+                if (strncmp(n, "en", 2) == 0) { strncpy(ipbuf, b, sizeof(ipbuf) - 1); break; }
+                if (!any[0]) strncpy(any, b, sizeof(any) - 1);
+            }
+            if (!ipbuf[0] && any[0]) {} // en 缺失时退回 any
+            if (strcmp(ipbuf, "?") == 0 && any[0]) strncpy(ipbuf, any, sizeof(ipbuf) - 1);
+            freeifaddrs(ifa);
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg), "ODEBUGD_BEACON %s %d %s", ipbuf, gPort, gVersion.UTF8String);
+        struct sockaddr_in a = {0};
+        a.sin_len = sizeof(a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(4323);
+        a.sin_addr.s_addr = INADDR_BROADCAST;
+        sendto(s, msg, (int)strlen(msg), 0, (struct sockaddr *)&a, sizeof(a));
+        sleep(5);
+    }
+    return NULL;
+}
+
+/// 1.0.144：Bonjour(mDNS) 广播线程——WLAN 模式下宣告 _odebugd._tcp.，
+/// 电脑端（odebug.sh）用 dns-sd 解析出手机 IP 直连，免手动输地址。
+static void *bonjourThread(void *unused) {
+    @autoreleasepool {
+        static OdbgBonjourLogger *lg;
+        NSNetService *svc = [[NSNetService alloc] initWithDomain:@"" type:@"_odebugd._tcp."
+                                                             name:@"odebugd" port:gPort];
+        lg = [[OdbgBonjourLogger alloc] init];
+        svc.delegate = lg;
+        [svc setTXTRecordData:[@"path=/" dataUsingEncoding:NSUTF8StringEncoding]];
+        [svc scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+        [svc publish];
+        applog(@"Bonjour 广播 _odebugd._tcp. 开始发布（结果见下一条日志）");
+        [[NSRunLoop currentRunLoop] run];
+    }
+    return NULL;
+}
+
 static NSString *loadToken(void) {
     NSArray<NSString *> *cands = @[
         [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.plist"],
@@ -2551,7 +2621,8 @@ static NSString *loadToken(void) {
         if ([t isKindOfClass:[NSString class]] && [t length]) return t;
     }
     const char *env = getenv("ODEBUG_TOKEN");
-    return env ? @(env) : nil;
+    if (env && env[0]) return @(env);
+    return @"opendebug";   // 1.0.144：首装默认令牌（与插件 4321 侧一致，改偏好即热生效）
 }
 
 /// 打一行内存/端口占用。daemon 曾经在长轮询命令（!win / !inject 的轮询）之后「无声无息」死掉，
@@ -2692,6 +2763,13 @@ int main(int argc, char **argv) {
         if (listen(srv, 16) != 0) { applog(@"listen 失败 errno=%d", errno); return 1; }
         fcntl(srv, F_SETFD, FD_CLOEXEC);   // ★ 绝不能被 posix_spawn 出来的子进程继承：否则子进程会一直占着这个监听端口
         applog(@"监听 %@:%d 就绪%@", gBindAny ? @"0.0.0.0" : @"127.0.0.1", gPort, gBindAny ? @"（WLAN 直连已开启：同网段电脑可直接连手机 IP，凭 token 鉴权）" : @"");
+
+        // 1.0.144：WLAN 模式下广播自动发现（Bonjour + UDP 信标双通道），电脑端免手动输 IP
+        if (gBindAny) {
+            pthread_t bn, bc2;
+            if (pthread_create(&bn, NULL, bonjourThread, NULL) == 0) pthread_detach(bn);
+            if (pthread_create(&bc2, NULL, beaconThread, NULL) == 0) pthread_detach(bc2);
+        }
 
         pthread_t wd;
         if (pthread_create(&wd, NULL, autoInjectThread, NULL) == 0) pthread_detach(wd);

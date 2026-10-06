@@ -79,6 +79,7 @@ static NSMutableString *tan_captureBuf = nil;
 static BOOL tan_captureOnly = NO;
 
 /// 发送响应到 TCP 客户端（不关闭连接，支持交互式连续输入）
+static NSString *tan_debugToken(void);   // 1.0.144：!token 用（实现在文件后段）
 static void tan_sendRsp(int fd, NSString *msg) {
     NSLog(@"[TANConsole] >> %@", msg);
     if (!msg) return;
@@ -397,6 +398,24 @@ static void tan_eval(int fd, NSString *raw) {
         return;
     }
     tan_lastCmd = raw;                         // 记录供 !grep 重放
+
+    // !token - 查看/修改调试令牌（1.0.144）：走 CFPreferences/cfprefsd，改完全部进程立即生效，无需 respring。
+    if ([raw hasPrefix:@"!token"]) {
+        NSString *arg = [[raw substringFromIndex:6] stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (arg.length == 0) {
+            tan_sendRsp(fd, [NSString stringWithFormat:@"当前调试令牌: %@\n用法: !token <新令牌>（立即生效，全部控制台同步）", tan_debugToken()]);
+            return;
+        }
+        if (arg.length < 1 || [arg rangeOfString:@" "].location != NSNotFound) {
+            tan_sendRsp(fd, @"❌ 令牌不能含空格"); return;
+        }
+        CFPreferencesSetAppValue(CFSTR("debugAuthToken"), (__bridge CFPropertyListRef)arg,
+                                 CFSTR("com.tanyou.opendebug.settings"));
+        CFPreferencesAppSynchronize(CFSTR("com.tanyou.opendebug.settings"));
+        tan_sendRsp(fd, [NSString stringWithFormat:@"✅ 调试令牌已改为 \"%@\"（立即生效，全部控制台同步）", arg]);
+        return;
+    }
 
     // !safe - 安全模式开关（禁用全部 tweak）：标记 /var/mobile/.eksafemode + respring / 用户空间重启
     if ([raw hasPrefix:@"!safe"]) {
@@ -1130,22 +1149,24 @@ static void _showIconWithReply(void(^reply)(NSString *)) {
 #ifndef TAN_NO_CONSOLE
 #pragma mark - 调试控制台认证
 
-/// 读取/生成调试令牌（只读自己的域 com.tanyou.opendebug.settings/debugAuthToken）
+/// 读取调试令牌（只读自己的域 com.tanyou.opendebug.settings/debugAuthToken）
+/// 1.0.144：去掉 dispatch_once 缓存——设置页改令牌后立即生效，无需 respring。
+/// 首次安装（无值）默认令牌 = "opendebug"（旧版是随机 UUID，不方便记忆输入）。
 static NSString *tan_debugToken(void) {
-    static NSString *token = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        CFStringRef domain = CFSTR("com.tanyou.opendebug.settings");
-        CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("debugAuthToken"), domain);
-        if (v && [(__bridge id)v isKindOfClass:[NSString class]] && [(__bridge NSString *)v length] > 0) {
-            token = (__bridge_transfer NSString *)v;
-        } else {
-            token = [[NSUUID UUID] UUIDString];
-            CFPreferencesSetAppValue(CFSTR("debugAuthToken"), (__bridge CFPropertyListRef)token, domain);
-            CFPreferencesAppSynchronize(domain);
-            NSLog(@"[TANConsole] 调试令牌: %@", token);
-        }
-    });
+    CFStringRef domain = CFSTR("com.tanyou.opendebug.settings");
+    // 1.0.144：去掉 dispatch_once 缓存 + 每次先 AppSynchronize 跟 cfprefsd 对齐——
+    // `!token <新令牌>`（或设置页）改完后新连接立即用新令牌，无需 respring。
+    // 注意：沙箱进程读不了 /var/mobile/.../settings.plist 原文件（!cat 实测无法读取），
+    // 唯一合法通道就是 cfprefsd。
+    CFPreferencesAppSynchronize(domain);
+    CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("debugAuthToken"), domain);
+    if (v && [(__bridge id)v isKindOfClass:[NSString class]] && [(__bridge NSString *)v length] > 0) {
+        return (__bridge_transfer NSString *)v;
+    }
+    NSString *token = @"opendebug";
+    CFPreferencesSetAppValue(CFSTR("debugAuthToken"), (__bridge CFPropertyListRef)token, domain);
+    CFPreferencesAppSynchronize(domain);
+    NSLog(@"[TANConsole] 无调试令牌，已写入默认令牌 opendebug");
     return token;
 }
 

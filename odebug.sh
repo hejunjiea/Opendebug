@@ -30,8 +30,10 @@ exec 2>&1
 
 PLIST=/var/mobile/Library/Preferences/com.tanyou.opendebug.settings.plist
 TOKEN_FILE="$HOME/.odebug_token"
-HOST=127.0.0.1
-PORT=4321
+# 端口/主机可覆盖：默认 4321=插件内控制台；ODEBUG_PORT=4322 连 odebugd 守护进程(!net/!fd/!safe/!auto…)；
+# WLAN 直连（1.0.142+，免数据线）：ODEBUG_HOST=192.168.0.107 ./odebug.sh（此时不起 iproxy）
+HOST=${ODEBUG_HOST:-127.0.0.1}
+PORT=${ODEBUG_PORT:-4321}
 
 # ── 端口转发（只在电脑上跑时需要）──────────────────────────────────────────
 # 控制台跑在**设备**的 SpringBoard 里，只绑设备自己的 127.0.0.1:4321。
@@ -46,14 +48,57 @@ TUNNEL_PID=""
 trap '[ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null' EXIT
 
 port_up() {
-    (exec 3<>/dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 || return 1
+    (exec 3<>/dev/tcp/$HOST/$PORT) >/dev/null 2>&1 || return 1
     exec 3>&- 2>/dev/null
     return 0
 }
 
+# 1.0.144：发现手机 IP 的两条路——
+# ① Bonjour(mDNS)：手机 WLAN 模式广播 _odebugd._tcp.，dns-sd 解析；
+# ② UDP 信标：手机每 5 秒向 255.255.255.255:4323 发 ODEBUGD_BEACON，这里监听 7 秒抓一次。
+# （ODEBUG_NO_BONJOUR=1 跳过自动发现）
+discover_odebugd() {
+    # ① Bonjour
+    if command -v dns-sd >/dev/null 2>&1; then
+        local tmp; tmp=$(mktemp)
+        dns-sd -L odebugd _odebugd._tcp local. > "$tmp" 2>/dev/null &
+        local p=$!
+        sleep 2
+        kill "$p" 2>/dev/null
+        local ip=$(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' "$tmp" | head -1 | cut -d: -f1)
+        rm -f "$tmp"
+        [ -n "$ip" ] && { echo "$ip"; return 0; }
+    fi
+    # ② UDP 信标：手机每 5 秒广播 `ODEBUGD_BEACON <ip> <port> <版本>`，抓一行解析出 IP
+    if command -v nc >/dev/null 2>&1; then
+        local tmp2; tmp2=$(mktemp)
+        ( nc -lu 4323 > "$tmp2" 2>/dev/null ) &
+        local p2=$!
+        sleep 7
+        kill "$p2" 2>/dev/null
+        local bip=$(grep -aoE 'ODEBUGD_BEACON ([0-9]{1,3}\.){3}[0-9]{1,3} [0-9]+' "$tmp2" | head -1 | awk '{print $2}')
+        rm -f "$tmp2"
+        [ -n "$bip" ] && { echo "$bip"; return 0; }
+    fi
+    return 1
+}
+
 ensure_tunnel() {
     [ -d /var/jb ] && return 0                 # 设备上运行：直连本机回环，无需转发
+    [ -n "$ODEBUG_HOST" ] && return 0          # WLAN 直连手机 IP：不需要 usbmuxd 转发
     port_up && return 0
+    # Bonjour 自动发现手机 IP（需手机侧「设置→ODebug→WLAN 直连」已开）
+    if [ -z "$ODEBUG_NO_BONJOUR" ]; then
+        local ip; ip=$(discover_odebugd)
+        if [ -n "$ip" ]; then
+            HOST="$ip"
+            if port_up; then
+                echo "📡 Bonjour 自动发现 odebugd：$HOST（WLAN 直连，免数据线）"
+                return 0
+            fi
+            HOST=${ODEBUG_HOST:-127.0.0.1}
+        fi
+    fi
     if ! command -v iproxy >/dev/null 2>&1; then
         echo "⚠️  本机 $HOST:$PORT 无监听，且找不到 iproxy（brew install usbmuxd）"
         return 1
@@ -127,9 +172,10 @@ send() {
 
     ensure_tunnel >/dev/null 2>&1
     if ! port_up; then
-        echo "❌ 连不上 $HOST:$PORT —— 本机没有到设备 4321 的转发，或设备侧控制台没在监听。"
-        echo "   · 电脑上：另开一个终端跑 ./odebug-iproxy.sh（本脚本也会尝试自动起 iproxy）"
-        echo "   · 设备上：确认 ODebug 已注入 SpringBoard（安全模式下插件不注入，控制台不可用）"
+        echo "❌ 连不上 $HOST:$PORT —— 无转发或目标控制台没在监听。"
+        echo "   · 插件控制台(4321)：电脑上另开终端跑 ./odebug-iproxy.sh（本脚本也会尝试自动起 iproxy）"
+        echo "   · 守护进程(4322)：ODEBUG_PORT=4322 ./odebug.sh；WLAN：加 ODEBUG_HOST=<手机IP>"
+        echo "   · 设备上：确认 ODebug 已注入 SpringBoard（安全模式下由看门狗注入回来）"
         echo "   · 自检：lsof -nP -iTCP:$PORT -sTCP:LISTEN"
         return 1
     fi
