@@ -38,6 +38,7 @@ PORT=${ODEBUG_PORT:-4321}
 # ── 端口切换（1.0.144）：默认直接进 4321；会话里按 x 在 4321 ⇄ 4322 之间互切 ──
 switch_port() {
     if [ "$PORT" = "4321" ]; then PORT=4322; else PORT=4321; fi
+    TUNNEL_OK=""                                # 端口变了，隧道状态作废
     echo "↔️  已切换到 $([ "$PORT" = "4321" ] && echo "插件控制台 4321" || echo "odebugd 守护进程 4322")"
     ensure_tunnel >/dev/null 2>&1
     if console_alive; then echo "✅ $HOST:$PORT 已连通"; else echo "⚠️  $HOST:$PORT 无响应（可能目标没在监听/需等 WLAN 发现）"; fi
@@ -66,7 +67,9 @@ port_up() {
 # 1.0.144：真正的「活着」= 控制台会回话。只测端口会被残留的僵尸 iproxy 骗过
 # （本地 TCP 能连上、但数据到不了设备 ⇒ 命令全部无回显）。
 console_alive() {
-    printf 'help\n' | nc -w 2 "$HOST" "$PORT" 2>/dev/null | grep -q "odebugd\|调试控制台"
+    # curl telnet 自带 --max-time 硬超时：活主机 <0.1s 出 banner；僵尸/死端口 ≤2s 返回空。
+    # （裸 nc -w 2 实测对「端口通但不回话」的僵尸转发会挂 ~20 秒，把每条命令都拖死。）
+    printf 'help\n' | curl -s --max-time 2 telnet://"$HOST":"$PORT" 2>/dev/null | grep -q "odebugd\|调试控制台"
 }
 
 # 1.0.144：发现手机 IP 的两条路——
@@ -103,13 +106,24 @@ ensure_tunnel() {
     [ -d /var/jb ] && return 0                 # 设备上运行：直连本机回环，无需转发
     [ -n "$ODEBUG_HOST" ] && { console_alive && return 0; return 0; }  # WLAN 直连手机 IP
     console_alive && return 0
-    # Bonjour 自动发现手机 IP（需手机侧「设置→ODebug→WLAN 直连」已开）
+    # ① 上次自动发现的 IP 先试（0.1s），别每次都重新走 9 秒发现流程
+    local cache="$HOME/.odebug_last_host"
+    if [ -f "$cache" ]; then
+        local hip; hip=$(cat "$cache" 2>/dev/null)
+        if [ -n "$hip" ] && [ "$hip" != "$HOST" ]; then
+            local saved=$HOST; HOST="$hip"
+            console_alive && return 0
+            HOST=$saved
+        fi
+    fi
+    # ② Bonjour / UDP 信标自动发现手机 IP（需手机侧「设置→ODebug→WLAN 直连」已开）
     if [ -z "$ODEBUG_NO_BONJOUR" ]; then
         local ip; ip=$(discover_odebugd)
         if [ -n "$ip" ]; then
             local saved=$HOST; HOST="$ip"
             if console_alive; then
-                echo "📡 自动发现 odebugd：$HOST（WLAN 直连，免数据线）"
+                echo "$ip" > "$cache" 2>/dev/null
+                echo "📡 自动发现 odebugd：$HOST（WLAN 直连，免数据线；已缓存到 $cache）"
                 return 0
             fi
             HOST=$saved
@@ -189,26 +203,37 @@ send() {
         sleep 1
     fi
 
-    ensure_tunnel >/dev/null 2>&1
-    if ! port_up; then
-        echo "❌ 连不上 $HOST:$PORT —— 无转发或目标控制台没在监听。"
+    # 1.0.144：上次成功过就跳过隧道重建（否则每条命令都可能重走 ~10s 发现流程）
+    if [ -z "$TUNNEL_OK" ]; then
+        ensure_tunnel >/dev/null 2>&1
+    fi
+    if ! console_alive; then
+        TUNNEL_OK=""
+        echo "❌ $HOST:$PORT 无响应 —— 隧道断了或目标控制台没在监听。"
         echo "   · 插件控制台(4321)：电脑上另开终端跑 ./odebug-iproxy.sh（本脚本也会尝试自动起 iproxy）"
-        echo "   · 守护进程(4322)：ODEBUG_PORT=4322 ./odebug.sh；WLAN：加 ODEBUG_HOST=<手机IP>"
+        echo "   · 守护进程(4322)：按 x 切换，或 ODEBUG_PORT=4322 ./odebug.sh；WLAN：加 ODEBUG_HOST=<手机IP>"
         echo "   · 设备上：确认 ODebug 已注入 SpringBoard（安全模式下由看门狗注入回来）"
         echo "   · 自检：lsof -nP -iTCP:$PORT -sTCP:LISTEN"
         return 1
     fi
+    TUNNEL_OK=1
 
     # 发送并捕获响应（过滤控制台欢迎语，避免每条命令重复显示）；!dump 遍历类 + 轮询，给更长超时
     # 回环（iproxy）用 bash /dev/tcp；WLAN 直连用 nc——macOS 对 bash 直连局域网会话会被安全机制掐死
-    local timeout=4
+    local timeout=2
     case "$cmd" in *dump*) timeout=40;; esac
     local output
     if [ "$HOST" = "127.0.0.1" ]; then
         output=$(TOKEN="$TOKEN" CMD="$cmd" TIMEOUT="$timeout" RHOST="$HOST" RPORT="$PORT" bash -c '
             exec 3<>/dev/tcp/$RHOST/$RPORT
             printf "AUTH $TOKEN $CMD\n" >&3
-            while read -t $TIMEOUT line <&3; do echo "$line"; done
+            # 首行等满超时；之后 1 秒无新行即收工（连接不关也能立刻退出，不再干等 4 秒）
+            first=1
+            while true; do
+                if [ "$first" = 1 ]; then read -t $TIMEOUT line <&3 || break; first=0
+                else read -t 1 line <&3 || break; fi
+                echo "$line"
+            done
             exec 3>&-
         ' | grep -v "ODebug 调试控制台: 输入 help")
     else
@@ -278,18 +303,8 @@ find_frida_python() {
     return 1
 }
 
-# 控制台是否真的在应答（只看端口会误判：iproxy 起着但设备侧没监听时连接会立刻被拒）
-console_alive() {
-    port_up || return 1
-    local out
-    out=$(TOKEN="$TOKEN" bash -c '
-        exec 3<>/dev/tcp/127.0.0.1/4321 || exit 1
-        printf "AUTH $TOKEN !safe status\n" >&3
-        read -t 3 line <&3 && echo "$line"
-        exec 3>&-
-    ' 2>/dev/null)
-    [ -n "$out" ]
-}
+# 控制台是否真的在应答：统一用文件前段的 console_alive()（curl telnet 探测，支持任意 HOST/PORT）。
+# 旧版（写死 127.0.0.1:4321 的 frida 时代探测）已删除——它会覆盖新定义导致 WLAN 模式全部误判。
 
 safemode_via_frida() {          # $1 = enter | exit | enter-ureboot | status
     local py
