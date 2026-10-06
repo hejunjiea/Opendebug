@@ -75,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.151";
+static NSString *gVersion = @"1.0.152";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2702,7 +2702,11 @@ static void clientLoop(int fd) {
             if ([[line uppercaseString] hasPrefix:@"VCDUMP "]) {
                 // 注入到目标 App 的 ODebug.dylib 回传视图树（免 token：内容只是视图树文本，
                 // 且来自本机 App；WLAN 下 Mac 没有 idevicesyslog，走这条路显示）
-                odbgVcDumpAppend([line substringFromIndex:7]);
+                // App 侧发的是单行 base64（多行裸文本会被本循环按行截断）；兼容旧明文
+                NSString *body = [line substringFromIndex:7];
+                NSData *dec = [[NSData alloc] initWithBase64EncodedString:body options:0];
+                NSString *txt = dec ? [[NSString alloc] initWithData:dec encoding:NSUTF8StringEncoding] : body;
+                odbgVcDumpAppend(txt ?: body);
                 write(fd, "ok\n", 3);
                 continue;
             }

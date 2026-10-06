@@ -136,7 +136,9 @@ void tan_sendVcDumpToDaemon(NSString *text) {
         struct timeval tv = {2, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         if (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
-            NSString *msg = [NSString stringWithFormat:@"VCDUMP %@\n", text];
+            // 协议=单行 "VCDUMP <base64(文本)>"：daemon 按行解析，多行裸文本会被截断（只留第一行）
+            NSData *raw = [text dataUsingEncoding:NSUTF8StringEncoding];
+            NSString *msg = [NSString stringWithFormat:@"VCDUMP %@\n", [raw base64EncodedStringWithOptions:0]];
             const char *p = msg.UTF8String;
             size_t left = strlen(p);
             while (left > 0) {
