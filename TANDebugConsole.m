@@ -1181,6 +1181,18 @@ static NSString *tan_authParse(NSString *raw) {
 }
 
 __attribute__((constructor)) void TANDebugConsoleStart(void) {
+    // Darwin 通知监听必须在**所有被注入进程**注册（!front/!vcapp 靠它让目标 App 打印视图树）。
+    // 注意：必须在下面的 SpringBoard 早退之前——否则 App 进程一个监听器都注册不上
+    // （1.0.148 之前的 bug：注册调用漏了，WLAN 下视图树回传一直没触发过）。
+    TANVCDumpRegisterDarwinListener();
+    // 探针：每个被注入进程加载时向 odebugd(4322) 报到一次，验证 App→daemon 通道
+    {
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier
+                        ?: [NSProcessInfo processInfo].processName;
+        tan_sendVcDumpToDaemon([NSString stringWithFormat:
+            @"[ctor] %@ 已加载 ODebug.dylib (pid=%@)", bid,
+            [NSString stringWithFormat:@"%d", getpid()]]);
+    }
     // 只在 SpringBoard 进程启动 TCP 服务（插件为全进程注入，其他进程不应绑 4321）
     if (![[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"]) return;
     NSLog(@"[TANConsole] 启动...");

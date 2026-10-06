@@ -125,7 +125,7 @@ static BOOL tan_hasVisibleUI(void) {
 
 /// 把 dump 文本回传给 odebugd(4322)（WLAN 下 Mac 没有 idevicesyslog，靠这个通道显示）
 /// 异步后台发，失败静默（daemon 不在也无所谓，syslog 里仍有 NSLog 的那份）
-static void tan_sendVcDumpToDaemon(NSString *text) {
+void tan_sendVcDumpToDaemon(NSString *text) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return;

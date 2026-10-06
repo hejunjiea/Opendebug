@@ -32,6 +32,8 @@ NSString *TANVCDumpTopViewControllerString(void);
 /// 收到后把当前进程的 keyWindow 视图树打印到 syslog（[open] 前缀）
 /// 供注入目标 App 进程使用（由 Tweak.xm 构造器在选中 App 里调用）。
 void TANVCDumpRegisterDarwinListener(void);
+/// 把文本回传给 odebugd(4322)（VCDUMP 通道，WLAN 下视图树靠它显示）
+void tan_sendVcDumpToDaemon(NSString *text);
 
 #ifdef __cplusplus
 }
