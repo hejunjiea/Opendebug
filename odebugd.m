@@ -75,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.144";
+static NSString *gVersion = @"1.0.145";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
