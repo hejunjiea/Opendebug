@@ -20,7 +20,7 @@
 			<key>label</key>
 			<string>调试令牌</string>
 			<key>placeholder</key>
-			<string>连 TCP 控制台用；改后需重启 SpringBoard</string>
+			<string>连 TCP 控制台用；首装默认 opendebug，改后立即生效</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -102,6 +102,50 @@
 			<string>safeMode</string>
 			<key>label</key>
 			<string>进入安全模式</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>使用说明 · 两个控制台端口</string>
+			<key>footerText</key>
+			<string>4321 = 插件控制台：ODebug.dylib 注入到哪个进程，就连到哪个进程体内工作（视图树 / 类信息 / 内存 / 沙箱文件，能力最强，但进程没被注入就没有）。
+
+4322 = odebugd 守护进程：root 常驻服务，开机自启、安全模式下也不失联。负责进程注入(!fd)、看门狗自动兜底（安全模式洗白 SpringBoard 后自动注回 ODebug.dylib，4321 随即复活）、软件包自更新(!dpkg)、进程启动(!spawn)。
+
+两个端口都需要鉴权：连接后先发 AUTH 令牌 命令（令牌见上方，首装默认 opendebug）。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>使用说明 · 怎么连</string>
+			<key>footerText</key>
+			<string>① USB：电脑 iproxy 4321 4321（或 4322 4322）后 telnet/nc 127.0.0.1。
+
+② WLAN（先开上方开关）：同一 Wi-Fi 下直连 手机IP:4321 / :4322；手机 IP 可在 4322 发 !net 查看。Mac 端运行项目里的 odebug.sh 会通过 UDP 信标自动发现手机 IP，无需手输。
+
+③ 脚本：analysis/tools/odebug_console.py --port 4321/4322 --token &lt;令牌&gt; '&lt;命令&gt;'。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>使用说明 · 常用命令</string>
+			<key>footerText</key>
+			<string>4321（进程内）: !vc top 最上层控制器 | !vc 视图树 | !class 类名 查类 | !ivars 地址 扒实例 | !dump 包名 导出全部类 | !eval 调用方法 | !mem read/write 读写内存 | !ls !cat !plist 沙箱文件 | !front !sys !process !apps | !icons 隐藏/显示图标 | !grep 过滤上一条 | !token 新令牌（免重启改令牌） | !safe on/off 进出安全模式。
+
+4322（系统级）: !fd pid dylib路径 注入任意进程 | !imgs pid 过滤 查镜像 | !spawn 路径 参数 root起进程 | !auto status 看门狗状态 | !net 查网络 | !putb+!pute+!dpkg+!restart 控制台自更新 | !safe off 退出安全模式（救援用）。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>使用说明 · 安全须知</string>
+			<key>footerText</key>
+			<string>· 令牌是唯一防线：别用弱令牌；WLAN 直连只在可信网络开启（任何人拿到令牌即可读写内存、执行代码）。
+· 插件出 bug 卡死时：4322 一般仍可用，发 !safe off 或等看门狗自动恢复。
+· 完整文档见项目 README.md（含注入器硬约束、部署链、故障排查）。</string>
 		</dict>
 	</array>
 	<key>title</key>
