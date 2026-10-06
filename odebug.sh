@@ -35,6 +35,22 @@ TOKEN_FILE="$HOME/.odebug_token"
 HOST=${ODEBUG_HOST:-127.0.0.1}
 PORT=${ODEBUG_PORT:-4321}
 
+# ── 傻瓜式端口选择（1.0.144）：直接运行脚本时弹菜单选 4321/4322；设了 ODEBUG_PORT/ODEBUG_HOST 则跳过 ──
+if [ -z "$ODEBUG_PORT" ] && [ -t 0 ]; then
+    echo ""
+    echo "  ═══ 连接哪个控制台？ ═══"
+    echo "   1) 插件控制台 4321（默认）── 视图树/类/内存/沙箱文件（能力最强）"
+    echo "   2) 守护进程 odebugd 4322 ── 注入!fd/看门狗!auto/!net/救援!safe（安全模式也不失联）"
+    printf '%s' "  选择 [1]: "
+    read -r _pick
+    case "$_pick" in
+        2) PORT=4322 ;;
+        *) PORT=4321 ;;
+    esac
+    echo "  → 已选择端口 $PORT"
+fi
+
+
 # ── 端口转发（只在电脑上跑时需要）──────────────────────────────────────────
 # 控制台跑在**设备**的 SpringBoard 里，只绑设备自己的 127.0.0.1:4321。
 # 在电脑上运行本脚本时，必须先把设备 4321 转出来（iproxy），否则 bash 的 /dev/tcp
