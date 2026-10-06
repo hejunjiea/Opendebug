@@ -1,9 +1,9 @@
 Package: com.tanyou.odebug
 Name: ODebug
 Depends: mobilesubstrate
-Changelog: 1.0.152: 修复,WLAN 视图树回传只显示标题不显示树的问题 | 1.0.151: 修 WLAN 视图树回传根因（Darwin 监听注册从未生效，现所有被注入进程都注册） | 1.0.148: !vclog 回传通道，App 侧 dump 直连 4322 上报（iOS17 无 log 命令、WLAN 下原无法显示视图树） | 1.0.146: Changelog 改单行格式（多行 x 真实 payload 触发 Sileo Bad deb） | 1.0.142: WLAN 直连 + !putb/!pute/!dpkg/!restart 纯 Wi-Fi 自更新 | 1.0.141: 注入器按 frida-core 复刻定型，安全模式下看门狗自动注回 SpringBoard
+Changelog: 1.0.153: 新增 !vccl 清空回传缓冲,odebug.sh 触发前自动清,只显示本次视图树 | 1.0.152: 修复,WLAN 视图树回传只显示标题不显示树的问题 | 1.0.151: 修 WLAN 视图树回传根因（Darwin 监听注册从未生效，现所有被注入进程都注册） | 1.0.148: !vclog 回传通道，App 侧 dump 直连 4322 上报（iOS17 无 log 命令、WLAN 下原无法显示视图树） | 1.0.146: Changelog 改单行格式（多行 x 真实 payload 触发 Sileo Bad deb） | 1.0.142: WLAN 直连 + !putb/!pute/!dpkg/!restart 纯 Wi-Fi 自更新 | 1.0.141: 注入器按 frida-core 复刻定型，安全模式下看门狗自动注回 SpringBoard
 Architecture: iphoneos-arm64e
-Version: 1.0.152
+Version: 1.0.153
 Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322（frida 式进程外注入器：安全模式/所有插件禁止注入时自动把插件注回 SpringBoard，4321 当场复活，无需 respring）
 Maintainer: tanyou
 Author: tanyou

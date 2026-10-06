@@ -75,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.152";
+static NSString *gVersion = @"1.0.153";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2354,6 +2354,15 @@ static NSString *cmdVcLog(NSString *arg) {
     return [NSString stringWithFormat:@"%@", r];
 }
 
+/// !vccl：清空回传缓冲（odebug.sh 触发前先清一次，!vclog 拉到的就只有本次新回传）
+static NSString *cmdVcClear(NSString *arg) {
+    (void)arg;
+    pthread_mutex_lock(&gVcLock);
+    [gVcDump setString:@""];
+    pthread_mutex_unlock(&gVcLock);
+    return @"✅ 回传缓冲已清空";
+}
+
 /// !net：网络状态——当前绑定模式 + 各网卡 IP（WLAN 直连要连哪个地址一目了然）
 static NSString *netInfo(void) {    NSMutableString *r = [NSMutableString stringWithFormat:
         @"odebugd 端口 %d，绑定 %@%@\n",
@@ -2561,6 +2570,9 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!tp "]) return cmdTaskProbe([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!sys"]) return systemInfo();
     if ([cmd isEqualToString:@"!net"]) return netInfo();
+    if ([cmd hasPrefix:@"!vccl"]) {
+        return cmdVcClear(nil);
+    }
     if ([cmd hasPrefix:@"!vclog"]) {
         NSString *a = [cmd length] > 6 ? [cmd substringFromIndex:7] : @"";
         return cmdVcLog(a);

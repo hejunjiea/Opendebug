@@ -203,6 +203,19 @@ send() {
         sleep 1
     fi
 
+    # 1.0.153：跨进程命令（!front/!vcapp）触发前先清 odebugd 回传缓冲并预备 4322 通道
+    # （USB 时本机没有 4322 转发 ⇒ 临时起一个 iproxy 4322，命令结束后收掉）
+    local _ip4322=""
+    if [ "$is_cross" = "1" ] && [ ! -d /var/jb ]; then
+        if [ "$HOST" = "127.0.0.1" ] && ! nc -z 127.0.0.1 4322 2>/dev/null; then
+            pkill -f "iproxy 4322 4322" >/dev/null 2>&1
+            iproxy 4322 4322 >/dev/null 2>&1 &
+            _ip4322=$!
+            sleep 1
+        fi
+        printf "AUTH $TOKEN !vccl\n" | nc -w 4 "$HOST" 4322 >/dev/null 2>&1
+    fi
+
     # 1.0.144：上次成功过就跳过隧道重建（否则每条命令都可能重走 ~10s 发现流程）
     if [ -z "$TUNNEL_OK" ]; then
         ensure_tunnel >/dev/null 2>&1
@@ -256,20 +269,24 @@ send() {
                 | grep -E "\[open\] /VCDump|Top:|keyWindow" \
                 | { [ -n "$filter" ] && grep "$filter" || cat; } \
                 | tail -40
-        elif [ -n "$logfile" ]; then
-            # Mac+USB：等 App 响应 + idevicesyslog 抓到；只显示 App 的 [open] /VCDump，过滤 SpringBoard 自身日志
-            sleep 3
-            kill $_PID 2>/dev/null
-            grep -E "\[open\] /VCDump|Top:|keyWindow" "$logfile" 2>/dev/null \
-                | { [ -n "$filter" ] && grep "$filter" || cat; } \
-                | head -40
-            rm -f "$logfile"
-        elif [ "$HOST" != "127.0.0.1" ]; then
-            # WLAN 直连：没有 USB 就没有 idevicesyslog ⇒ 走 odebugd(4322) 的 !vclog（root 读 os_log）
-            local vout
-            vout=$(printf "AUTH $TOKEN !vclog 25\n" | nc -w 30 "$HOST" 4322 2>/dev/null \
+        else
+            # Mac（USB 或 WLAN）：走 odebugd(4322) 的 !vclog 回传通道（缓冲已提前 !vccl 清空，
+            # 拉到的只有本次触发的新回传）。拉完收掉临时 iproxy。
+            local vout=""
+            vout=$(printf "AUTH $TOKEN !vclog 25\n" | nc -w 10 "$HOST" 4322 2>/dev/null \
                 | grep -v "odebugd" | grep -v "输入 help")
-            if [ -n "$filter" ]; then echo "$vout" | grep "$filter"; else echo "$vout"; fi
+            [ -n "$_ip4322" ] && kill $_ip4322 2>/dev/null
+            if [ -n "$vout" ]; then
+                if [ -n "$filter" ]; then echo "$vout" | grep "$filter"; else echo "$vout"; fi
+            elif [ -n "$logfile" ]; then
+                # 兜底：Mac+USB 且 !vclog 不可用（如 4322 没起）⇒ 退回 idevicesyslog 抓取
+                sleep 3
+                kill $_PID 2>/dev/null
+                grep -E "\[open\] /VCDump|Top:|keyWindow" "$logfile" 2>/dev/null \
+                    | { [ -n "$filter" ] && grep "$filter" || cat; } \
+                    | head -40
+            fi
+            rm -f "$logfile" 2>/dev/null
         fi
     fi
 
