@@ -67,6 +67,26 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>WLAN 直连（免数据线调试）</string>
+			<key>footerText</key>
+			<string>打开后 4321（插件控制台）与 4322（odebugd）都监听局域网：同一 Wi-Fi 下的电脑可直接连 手机IP:4321 / :4322，凭上方调试令牌鉴权。4321 改后需重启 SpringBoard 生效；4322 需重启 odebugd（控制台发 !restart 或重启手机）。查看手机 IP：4322 控制台发 !net。仅在自己可信的网络开启。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.tanyou.opendebug.settings</string>
+			<key>key</key>
+			<string>debugBindAll</string>
+			<key>label</key>
+			<string>WLAN 直连</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string>安全模式（禁用全部插件）</string>
 			<key>footerText</key>
 			<string>打开后写入标记 /var/mobile/.eksafemode 并重启 SpringBoard：所有插件停止注入（分屏 / 扇形菜单 / Crane / Choicy / AppSync … 全部失效）。退出：删除该标记后 respring（Filza 或 DFTerminal: rm -f /var/mobile/.eksafemode &amp;&amp; sbreload）。</string>

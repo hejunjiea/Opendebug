@@ -25,6 +25,7 @@
 #import <Foundation/Foundation.h>
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -74,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.142";
+static NSString *gVersion = @"1.0.143";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2318,8 +2319,31 @@ static NSString *helpText(void) {
         @"  !dpkg <deb路径>     用 jbroot 的 dpkg 装包（装完 !restart 生效）\n"
         @"  !restart            自杀重启 daemon（launchd KeepAlive 拉起）\n"
         @"  !sys                系统与服务信息\n"
+        @"  !net                网络状态：绑定模式 + 手机各网卡 IP（WLAN 直连用）\n"
         @"  !log [n]            看 odebugd 自己的日志（默认 40 行）\n"
         @"  !exit               断开本连接\n", gVersion, getpid()];
+}
+
+/// !net：网络状态——当前绑定模式 + 各网卡 IP（WLAN 直连要连哪个地址一目了然）
+static NSString *netInfo(void) {
+    NSMutableString *r = [NSMutableString stringWithFormat:
+        @"odebugd 端口 %d，绑定 %@%@\n",
+        gPort, gBindAny ? @"0.0.0.0（WLAN 直连开启）" : @"127.0.0.1（仅本机）",
+        gBindAny ? @"：同网段电脑直连 手机IP:4322，凭 token 鉴权" : @"：设置页开「WLAN 直连」或 !bind 后 !restart"];
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) == 0) {
+        char buf[INET_ADDRSTRLEN] = {0};
+        for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+            if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in *sa = (struct sockaddr_in *)p->ifa_addr;
+                if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf)) && strcmp(buf, "127.0.0.1") != 0)
+                    [r appendFormat:@"  %@: %s\n", @(p->ifa_name), buf];
+            }
+        }
+        freeifaddrs(ifa);
+    }
+    [r appendString:@"4321（插件控制台）跟随各自进程的 debugBindAll 设置（改后需 respring）"];
+    return r;
 }
 
 static NSString *systemInfo(void) {
@@ -2507,6 +2531,7 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!sym "]) return cmdSym([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!tp "]) return cmdTaskProbe([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!sys"]) return systemInfo();
+    if ([cmd isEqualToString:@"!net"]) return netInfo();
     if ([cmd hasPrefix:@"!log"]) return tailLog([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!token"]) return @"";
     return [NSString stringWithFormat:@"未知命令: %@（发 help 看菜单）\n", cmd];
@@ -2626,14 +2651,27 @@ int main(int argc, char **argv) {
         const char *pe = getenv("ODEBUGD_PORT");
         if (pe) gPort = atoi(pe);
         const char *pb = getenv("ODEBUGD_BIND");   // "0.0.0.0"/"lan"/"any" ⇒ 监听所有网卡（WLAN 直连）
-        if (pb) gBindAny = (strcasecmp(pb, "0.0.0.0") == 0 || strcasecmp(pb, "lan") == 0 || strcasecmp(pb, "any") == 0);
+        int bindExplicit = 0;
+        if (pb) { gBindAny = (strcasecmp(pb, "0.0.0.0") == 0 || strcasecmp(pb, "lan") == 0 || strcasecmp(pb, "any") == 0); bindExplicit = 1; }
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) gPort = atoi(argv[++i]);
             if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
                 const char *b = argv[++i];
                 gBindAny = (strcmp(b, "0.0.0.0") == 0 || strcasecmp(b, "lan") == 0 || strcasecmp(b, "any") == 0);
+                bindExplicit = 1;
             }
             if (strcmp(argv[i], "--foreground") == 0) { /* launchd 下默认即前台 */ }
+        }
+        // 没有显式 --bind/ODEBUGD_BIND 时，跟随设置页的「WLAN 直连」开关（debugBindAll）
+        if (!bindExplicit) {
+            for (NSString *p in @[
+                [gJbroot stringByAppendingString:@"/var/mobile/Library/Preferences/com.tanyou.opendebug.settings.plist"],
+                @"/var/mobile/Library/Preferences/com.tanyou.opendebug.settings.plist",
+            ]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+                id v = d[@"debugBindAll"];
+                if ([v respondsToSelector:@selector(boolValue)]) { gBindAny = [v boolValue]; break; }
+            }
         }
 
         applog(@"==== odebugd %@ 启动 (jbroot=%@, port=%d, uid=%d) ====", gVersion, gJbroot, gPort, getuid());

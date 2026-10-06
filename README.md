@@ -397,10 +397,10 @@ if ([raw isEqualToString:@"!hello"] || [raw hasPrefix:@"!hello "]) {
 安全模式只拦 tweak，拦不住 LaunchDaemon ⇒ **安全模式下 4321 死了、4322 还活着**，
 于是它既是应急调试通道，又是把 4321 救回来的注入器。
 
-### WLAN 直连模式（1.0.142 起，真机实测）
+### WLAN 直连模式（1.0.142 起，1.0.143 收进设置页）
 
-- `odebugd` 支持 `ODEBUGD_BIND` 环境变量 / `--bind` 参数：设为 `0.0.0.0`（LaunchDaemon 默认已开）⇒ 同网段电脑**免数据线直连 `手机IP:4322`**，token 鉴权照旧。
-- 插件内 4321 控制台：偏好 `debugBindAll=1`（`com.tanyou.opendebug.settings` 域）⇒ 也监听所有网卡。
+- **设置页「WLAN 直连」开关（1.0.143）**：一个开关统管 4321+4322（偏好 `debugBindAll`）。4321 改后需 respring；4322 重启后生效（`!restart` 或重启手机）。打开 ⇒ 同网段电脑**免数据线直连 `手机IP:4321/:4322`**，token 鉴权照旧；`!net` 随时查当前绑定与手机各网卡 IP。
+- 显式覆盖（优先于设置页）：`ODEBUGD_BIND` 环境变量 / `--bind` 参数（`0.0.0.0`/`lan`/`any` 开，`127.0.0.1` 关）。
 - 自给自足命令：`!putb <路径> <base64>`（分段上传）+ `!pute <路径>`（收尾 chmod）、`!dpkg <deb>`（用 jbroot 的 dpkg 装包）、`!restart`（自杀，launchd 拉起新版）⇒ **纯 Wi-Fi 即可传包/升级自己**。
   - ⚠️ roothide 路径戏法：daemon 视角的 `/tmp` 实际落在真实 `/rootfs/private/var/tmp` ⇒ `!dpkg` 要用 `/rootfs/private/var/tmp/xxx.deb` 这个 dpkg 子进程视角的路径（真机踩过：daemon 视角路径 dpkg 报 ENOENT）。
 - Mac 侧：`odebug_console.py --host <手机IP> --port 4322 --token ty '<命令>'`（`--host` 时不起 iproxy）。
