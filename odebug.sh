@@ -197,15 +197,21 @@ send() {
     fi
 
     # 发送并捕获响应（过滤控制台欢迎语，避免每条命令重复显示）；!dump 遍历类 + 轮询，给更长超时
-    local timeout=2
+    # 回环（iproxy）用 bash /dev/tcp；WLAN 直连用 nc——macOS 对 bash 直连局域网会话会被安全机制掐死
+    local timeout=4
     case "$cmd" in *dump*) timeout=40;; esac
     local output
-    output=$(TOKEN="$TOKEN" CMD="$cmd" TIMEOUT="$timeout" bash -c '
-        exec 3<>/dev/tcp/127.0.0.1/4321
-        printf "AUTH $TOKEN $CMD\n" >&3
-        while read -t $TIMEOUT line <&3; do echo "$line"; done
-        exec 3>&-
-    ' | grep -v "ODebug 调试控制台: 输入 help")
+    if [ "$HOST" = "127.0.0.1" ]; then
+        output=$(TOKEN="$TOKEN" CMD="$cmd" TIMEOUT="$timeout" RHOST="$HOST" RPORT="$PORT" bash -c '
+            exec 3<>/dev/tcp/$RHOST/$RPORT
+            printf "AUTH $TOKEN $CMD\n" >&3
+            while read -t $TIMEOUT line <&3; do echo "$line"; done
+            exec 3>&-
+        ' | grep -v "ODebug 调试控制台: 输入 help")
+    else
+        output=$(printf "AUTH $TOKEN $cmd\n" | nc -w $timeout "$HOST" "$PORT" \
+            | grep -v "ODebug 调试控制台: 输入 help" | grep -v "输入 help 看命令菜单")
+    fi
     if [ -n "$filter" ]; then
         echo "$output" | grep "$filter"
     else
@@ -324,11 +330,36 @@ menu() {
     # ANSI 颜色
     local C_G='\033[32m' C_C='\033[36m' C_B='\033[34m' C_Y='\033[33m'
     local C_R='\033[0m' C_D='\033[37m' C_BLD='\033[1m'
-    echo
-    echo -e "  ${C_BLD}${C_B}═══ ODebug 调试控制台 ═══${C_R}  直接输入命令（无需 AUTH），或按快捷键：\n"
     local sec title
     sec() { title="$1"; echo -e "  ${C_Y}◆${C_R} ${C_BLD}${title}${C_R}"; }
     row() { printf "    ${C_G}%-2s${C_R} ${C_C}%-20s${C_D}%s${C_R}\n" "$1" "$2" "$3"; }
+
+    if [ "$PORT" = "4322" ]; then
+        # ── odebugd 守护进程菜单（4322 专属命令）──
+        echo -e "  ${C_BLD}${C_B}═══ odebugd 守护进程 (4322) ═══${C_R}  root 系统级控制台，安全模式也不失联\n"
+        sec "注入 / 进程"
+        row f "!fd <pid> <dylib>" "向任意进程注入 dylib"
+        row i "!imgs <pid> [过滤]" "查进程镜像(验证注入)"
+        row s "!spawn <路径> [参数]" "root 起进程"
+        row p "!ps" "进程列表"
+        sec "看门狗 / 网络"
+        row a "!auto status" "看门狗(安全模式自动兜底)"
+        row n "!net" "绑定模式+手机各网卡IP"
+        row y "!sys" "系统信息"
+        sec "文件 / 包管理"
+        row l "!ls <路径>" "列目录"
+        row c "!cat <路径>" "读文件"
+        row d "!dpkg <deb路径>" "安装 deb(自更新链)"
+        row r "!restart" "重启 odebugd"
+        sec "救援"
+        row m "!safe off" "退出安全模式(救援)"
+        row h "help" "帮助(全部命令)"
+        row 0 "exit" "退出"
+        echo -e "  ${C_D}4321 专属(!vc/!class/!dump/!eval…)在这里不可用——那些在插件控制台里${C_R}\n"
+        return
+    fi
+
+    echo -e "  ${C_BLD}${C_B}═══ ODebug 调试控制台 ═══${C_R}  直接输入命令（无需 AUTH），或按快捷键：\n"
 
     sec "视图 / 控制器"
     row 1 "!vc [类名]" "视图树(可过滤)"
@@ -375,6 +406,32 @@ while true; do
     [ -z "$input" ] && { menu; continue; }
     case "$input" in
         0) echo "再见"; exit 0;;
+        h|H|help) send "help"; menu;;
+        clear|cls) clear; menu;;
+        *) if [ "$PORT" = "4322" ]; then
+               # ── 4322 守护进程：快捷键映射到 daemon 命令 ──
+               case "$input" in
+                   f|F) printf '%s' "pid: "; read -r pid; printf '%s' "dylib路径: "; read -r dy; [ -n "$pid" ] && [ -n "$dy" ] && send "!fd $pid $dy";;
+                   i|I) printf '%s' "pid(如 springboard/4321/self): "; read -r pid; printf '%s' "过滤词(可空): "; read -r kw; send "!imgs $pid $kw";;
+                   s|S) printf '%s' "程序绝对路径: "; read -r p; printf '%s' "参数(可空): "; read -r args; send "!spawn $p $args";;
+                   p|P) send "!ps";;
+                   a|A) printf '%s' "auto命令(status/on/off/run)[status]: "; read -r x; send "!auto ${x:-status}";;
+                   n|N) send "!net";;
+                   y|Y) send "!sys";;
+                   l|L) printf '%s' "目录路径: "; read -r p; [ -n "$p" ] && send "!ls $p";;
+                   c|C) printf '%s' "文件路径: "; read -r p; [ -n "$p" ] && send "!cat $p";;
+                   d|D) printf '%s' "deb路径(设备上的): "; read -r p; [ -n "$p" ] && send "!dpkg $p";;
+                   r|R) printf '%s' "确认重启 odebugd? (y/N): "; read -r x; [ "$x" = "y" ] && send "!restart";;
+                   m|M) printf '%s' "确认退出安全模式(删标记+重启SB)? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe off";;
+                   *) if [[ "$input" == \!* || "$input" == AUTH* || "$input" == "help" || "$input" == "?" ]]; then
+                          send "$input"
+                      else
+                          echo "\$ $input"; eval "$input"
+                      fi;;
+               esac
+           else
+               # ── 4321 插件控制台 ──
+               case "$input" in
         1) send "!vc";;
         2) send "!vc top";;
         3) printf '%s' "类名: "; read -r cn; [ -n "$cn" ] && send "!class $cn";;
@@ -399,12 +456,12 @@ while true; do
         g|G) printf '%s' "关键词: "; read -r kw; [ -n "$kw" ] && send "!grep $kw";;
         m|M) safemode_interactive;;
         c|C) printf '%s' "icons命令(list/hide <bundleId>/show): "; read -r x; [ -n "$x" ] && send "!icons $x";;
-        h|H|help) send "help"; menu;;
-        clear|cls) clear; menu;;
         *) if [[ "$input" == \!* || "$input" == AUTH* || "$input" == \[* || "$input" == "help" || "$input" == "?" ]]; then
                send "$input"          # 控制台命令（! 开头 / [类名 方法] / help / ?）
            else
                echo "\$ $input"; eval "$input"   # Mac 本地命令（cat/ls/grep 等）
+           fi;;
+               esac
            fi;;
     esac
 done
