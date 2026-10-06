@@ -503,7 +503,12 @@ while true; do
         *) if [[ "$input" == \!* || "$input" == AUTH* || "$input" == \[* || "$input" == "help" || "$input" == "?" ]]; then
                send "$input"          # 控制台命令（! 开头 / [类名 方法] / help / ?）
            else
-               echo "\$ $input"; eval "$input"   # Mac 本地命令（cat/ls/grep 等）
+               # 护栏：纯符号/残缺输入（如粘贴到的 > 或 )）不当命令执行，避免 bash 语法错误刷屏
+               if [[ "$input" =~ ^[[:space:]\>\<\)\(\;\|\&]+$ ]]; then
+                   echo "（忽略：纯符号输入不是命令）"
+               else
+                   echo "\$ $input"; eval "$input"   # Mac 本地命令（cat/ls/grep 等）
+               fi
            fi;;
                esac
            fi;;
