@@ -40,7 +40,7 @@ switch_port() {
     if [ "$PORT" = "4321" ]; then PORT=4322; else PORT=4321; fi
     echo "↔️  已切换到 $([ "$PORT" = "4321" ] && echo "插件控制台 4321" || echo "odebugd 守护进程 4322")"
     ensure_tunnel >/dev/null 2>&1
-    if port_up; then echo "✅ $HOST:$PORT 已连通"; else echo "⚠️  $HOST:$PORT 暂时连不上（可能目标没在监听/需等 WLAN 发现）"; fi
+    if console_alive; then echo "✅ $HOST:$PORT 已连通"; else echo "⚠️  $HOST:$PORT 无响应（可能目标没在监听/需等 WLAN 发现）"; fi
     menu
 }
 
@@ -61,6 +61,12 @@ port_up() {
     (exec 3<>/dev/tcp/$HOST/$PORT) >/dev/null 2>&1 || return 1
     exec 3>&- 2>/dev/null
     return 0
+}
+
+# 1.0.144：真正的「活着」= 控制台会回话。只测端口会被残留的僵尸 iproxy 骗过
+# （本地 TCP 能连上、但数据到不了设备 ⇒ 命令全部无回显）。
+console_alive() {
+    printf 'help\n' | nc -w 2 "$HOST" "$PORT" 2>/dev/null | grep -q "odebugd\|调试控制台"
 }
 
 # 1.0.144：发现手机 IP 的两条路——
@@ -95,22 +101,25 @@ discover_odebugd() {
 
 ensure_tunnel() {
     [ -d /var/jb ] && return 0                 # 设备上运行：直连本机回环，无需转发
-    [ -n "$ODEBUG_HOST" ] && return 0          # WLAN 直连手机 IP：不需要 usbmuxd 转发
-    port_up && return 0
+    [ -n "$ODEBUG_HOST" ] && { console_alive && return 0; return 0; }  # WLAN 直连手机 IP
+    console_alive && return 0
     # Bonjour 自动发现手机 IP（需手机侧「设置→ODebug→WLAN 直连」已开）
     if [ -z "$ODEBUG_NO_BONJOUR" ]; then
         local ip; ip=$(discover_odebugd)
         if [ -n "$ip" ]; then
-            HOST="$ip"
-            if port_up; then
-                echo "📡 Bonjour 自动发现 odebugd：$HOST（WLAN 直连，免数据线）"
+            local saved=$HOST; HOST="$ip"
+            if console_alive; then
+                echo "📡 自动发现 odebugd：$HOST（WLAN 直连，免数据线）"
                 return 0
             fi
-            HOST=${ODEBUG_HOST:-127.0.0.1}
+            HOST=$saved
         fi
     fi
+    # 清掉残留的僵尸 iproxy（占着端口但数据不通），再重新起
+    pkill -f "iproxy $PORT $PORT" >/dev/null 2>&1
+    sleep 0.2
     if ! command -v iproxy >/dev/null 2>&1; then
-        echo "⚠️  本机 $HOST:$PORT 无监听，且找不到 iproxy（brew install usbmuxd）"
+        echo "⚠️  本机 $HOST:$PORT 无响应，且找不到 iproxy（brew install usbmuxd）"
         return 1
     fi
     if [ -n "$UDID" ]; then
@@ -120,13 +129,13 @@ ensure_tunnel() {
     fi
     TUNNEL_PID=$!
     for _i in $(seq 1 40); do
-        if port_up; then
+        if console_alive; then
             echo "🔌 已自动启动 iproxy $PORT → 设备 $PORT ${UDID:+（$UDID）}"
             return 0
         fi
         sleep 0.25
     done
-    echo "⚠️  iproxy 启动失败：$HOST:$PORT 仍无监听"
+    echo "⚠️  iproxy 启动失败：$HOST:$PORT 无响应"
     return 1
 }
 
