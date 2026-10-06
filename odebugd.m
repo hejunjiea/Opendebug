@@ -73,7 +73,8 @@ static NSString *odbgDefaultPluginPath(void) {
 }
 static NSString *gLogPath = nil;
 static int gPort = 4322;
-static NSString *gVersion = @"1.0.141";
+static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
+static NSString *gVersion = @"1.0.142";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2181,6 +2182,106 @@ static NSString *cmdInjectImpl(NSString *arg) {
 
 #pragma mark - 命令分发
 
+/// 在设备上运行一条命令并捕获输出（WLAN 自给自足：!dpkg 等用）
+static NSString *odbgRunCapture(NSString *exe, NSArray<NSString *> *args, int timeoutSec) {
+    int outfd[2];
+    if (pipe(outfd) != 0) return @"❌ pipe 失败\n";
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, outfd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, outfd[1], STDERR_FILENO);
+    int maxfd = getdtablesize();
+    if (maxfd > 512) maxfd = 512;
+    for (int i = 3; i < maxfd; i++)
+        if (fcntl(i, F_GETFD) != -1 && i != outfd[0] && i != outfd[1]) posix_spawn_file_actions_addclose(&fa, i);
+    const char **argv = calloc(args.count + 2, sizeof(char *));
+    argv[0] = exe.UTF8String;
+    for (NSUInteger i = 0; i < args.count; i++) argv[i + 1] = args[i].UTF8String;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, argv[0], &fa, &attr, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    free(argv);
+    close(outfd[1]);
+    if (rc != 0) { close(outfd[0]); return [NSString stringWithFormat:@"❌ posix_spawn(%@) rc=%d\n", exe, rc]; }
+    NSMutableData *buf = [NSMutableData data];
+    fcntl(outfd[0], F_SETFL, O_NONBLOCK);
+    time_t deadline = time(NULL) + timeoutSec;
+    while (time(NULL) < deadline) {
+        char tmp[4096];
+        ssize_t n = read(outfd[0], tmp, sizeof(tmp));
+        if (n > 0) {
+            [buf appendBytes:tmp length:(NSUInteger)n];
+            if (buf.length > 400 * 1024) break;
+            continue;
+        }
+        int st = 0; pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid) {   // 收尾：再吸一口剩余输出
+            while ((n = read(outfd[0], tmp, sizeof(tmp))) > 0) [buf appendBytes:tmp length:(NSUInteger)n];
+            close(outfd[0]);
+            NSString *s = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
+            if (!s) s = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
+            if (s.length > 20000) s = [[s substringToIndex:20000] stringByAppendingString:@"\n…(截断)"];
+            return [NSString stringWithFormat:@"退出码=%d\n%@", WEXITSTATUS(st), s];
+        }
+        usleep(80 * 1000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    close(outfd[0]);
+    NSString *s = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
+    if (!s) s = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
+    return [NSString stringWithFormat:@"⏱ 超时(%d 秒)已杀，已有输出：\n%@", timeoutSec, s];
+}
+
+/// !putb <路径> <base64> —— 追加写一段二进制（WLAN 上传文件用，配 !pute 收尾）
+static NSString *cmdPutBegin(NSString *arg) {
+    NSRange sp = [arg rangeOfString:@" "];
+    if (sp.location == NSNotFound) return @"用法: !putb <路径> <base64 段>\n";
+    NSString *path = trim([arg substringToIndex:sp.location]);
+    NSString *b64 = trim([arg substringFromIndex:sp.location + 1]);
+    NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (!d) return @"❌ base64 解不开\n";
+    FILE *f = fopen(path.UTF8String, "ab");
+    if (!f) return [NSString stringWithFormat:@"❌ 打不开 %@（errno=%d，目录不存在或没权限）\n", path, errno];
+    size_t w = d.length ? fwrite(d.bytes, 1, d.length, f) : 0;
+    fclose(f);
+    NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    unsigned long long sz = [at fileSize];
+    return [NSString stringWithFormat:@"已追加 %zu 字节，累计 %llu 字节\n", w, sz];
+}
+
+/// !pute <路径> —— 上传收尾（chmod + 报大小）
+static NSString *cmdPutEnd(NSString *arg) {
+    NSString *path = trim(arg);
+    if (!path.length) return @"用法: !pute <路径>\n";
+    NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    if (!at) return @"❌ 文件不存在\n";
+    chmod(path.UTF8String, 0755);
+    return [NSString stringWithFormat:@"✅ %@ 就绪，%llu 字节（0755）\n", path, [at fileSize]];
+}
+
+/// !dpkg <deb路径> —— 用 jbroot 里的 dpkg 装包（装完 !restart 换新 daemon）
+static NSString *cmdDpkgInstall(NSString *arg) {
+    NSString *deb = trim(arg);
+    if (!deb.length) return @"用法: !dpkg <deb 路径>（先用 !putb/!pute 传上来）\n";
+    NSString *dpkg = [gJbroot stringByAppendingString:@"/usr/bin/dpkg"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dpkg]) dpkg = @"/usr/bin/dpkg";
+    return odbgRunCapture(dpkg, @[ @"-i", deb ], 120);
+}
+
+/// !restart —— 自杀让 launchd 拉起新进程（升级 odebugd 后用）
+static NSString *cmdRestart(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        applog(@"收到 !restart ⇒ SIGTERM 自杀，launchd 会拉起新进程");
+        kill(getpid(), SIGTERM);
+    });
+    return @"0.4 秒后自杀重启（KeepAlive 会拉起），稍等 2 秒再重连\n";
+}
+
 static NSString *helpText(void) {
     return [NSString stringWithFormat:
         @"ODebug 常驻调试服务 odebugd %@ (pid %d)\n"
@@ -2212,6 +2313,10 @@ static NSString *helpText(void) {
         @"  !imgs <pid> [过滤]  列目标进程已加载的镜像（找依赖库用）\n"
         @"  !tp <pid>           task_for_pid / 远程 VM / 远程线程可行性探针\n"
         @"  !spawn <路径> [参数] 起一个一次性进程（注入试验靶子）\n"
+        @"  !putb <路径> <b64> WLAN 上传：追加一段 base64（配 !pute）\n"
+        @"  !pute <路径>        WLAN 上传收尾（chmod 0755 + 报大小）\n"
+        @"  !dpkg <deb路径>     用 jbroot 的 dpkg 装包（装完 !restart 生效）\n"
+        @"  !restart            自杀重启 daemon（launchd KeepAlive 拉起）\n"
         @"  !sys                系统与服务信息\n"
         @"  !log [n]            看 odebugd 自己的日志（默认 40 行）\n"
         @"  !exit               断开本连接\n", gVersion, getpid()];
@@ -2393,6 +2498,11 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!pth "]) return cmdPthreadDlopen([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!rx "]) return cmdRxTest([cmd substringFromIndex:4]);
     if ([cmd hasPrefix:@"!spawn "]) return cmdSpawn([cmd substringFromIndex:7]);
+    if ([cmd hasPrefix:@"!putb "]) return cmdPutBegin([cmd substringFromIndex:6]);
+    if ([cmd hasPrefix:@"!pute "]) return cmdPutEnd([cmd substringFromIndex:6]);
+    if ([cmd hasPrefix:@"!pute"]) return cmdPutEnd(trim([cmd substringFromIndex:5]));
+    if ([cmd hasPrefix:@"!dpkg "]) return cmdDpkgInstall([cmd substringFromIndex:6]);
+    if ([cmd hasPrefix:@"!restart"]) return cmdRestart();
     if ([cmd hasPrefix:@"!imgs"]) return cmdImages([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!sym "]) return cmdSym([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!tp "]) return cmdTaskProbe([cmd substringFromIndex:4]);
@@ -2515,8 +2625,14 @@ int main(int argc, char **argv) {
 
         const char *pe = getenv("ODEBUGD_PORT");
         if (pe) gPort = atoi(pe);
+        const char *pb = getenv("ODEBUGD_BIND");   // "0.0.0.0"/"lan"/"any" ⇒ 监听所有网卡（WLAN 直连）
+        if (pb) gBindAny = (strcasecmp(pb, "0.0.0.0") == 0 || strcasecmp(pb, "lan") == 0 || strcasecmp(pb, "any") == 0);
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) gPort = atoi(argv[++i]);
+            if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+                const char *b = argv[++i];
+                gBindAny = (strcmp(b, "0.0.0.0") == 0 || strcasecmp(b, "lan") == 0 || strcasecmp(b, "any") == 0);
+            }
             if (strcmp(argv[i], "--foreground") == 0) { /* launchd 下默认即前台 */ }
         }
 
@@ -2530,14 +2646,14 @@ int main(int argc, char **argv) {
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
         sa.sin_port = htons((uint16_t)gPort);
-        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // 只绑回环：电脑侧用 iproxy / SSH 隧道
+        sa.sin_addr.s_addr = gBindAny ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);   // WLAN 直连模式绑 0.0.0.0（token 鉴权），默认仅回环
         if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            applog(@"bind 127.0.0.1:%d 失败 errno=%d", gPort, errno);
+            applog(@"bind %@:%d 失败 errno=%d", gBindAny ? @"0.0.0.0" : @"127.0.0.1", gPort, errno);
             return 1;
         }
         if (listen(srv, 16) != 0) { applog(@"listen 失败 errno=%d", errno); return 1; }
         fcntl(srv, F_SETFD, FD_CLOEXEC);   // ★ 绝不能被 posix_spawn 出来的子进程继承：否则子进程会一直占着这个监听端口
-        applog(@"监听 127.0.0.1:%d 就绪", gPort);
+        applog(@"监听 %@:%d 就绪%@", gBindAny ? @"0.0.0.0" : @"127.0.0.1", gPort, gBindAny ? @"（WLAN 直连已开启：同网段电脑可直接连手机 IP，凭 token 鉴权）" : @"");
 
         pthread_t wd;
         if (pthread_create(&wd, NULL, autoInjectThread, NULL) == 0) pthread_detach(wd);

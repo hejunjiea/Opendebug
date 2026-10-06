@@ -1171,7 +1171,14 @@ __attribute__((constructor)) void TANDebugConsoleStart(void) {
         struct sockaddr_in a = {0};
         a.sin_len = sizeof(a);
         a.sin_family = AF_INET;
-        a.sin_addr.s_addr = inet_addr("127.0.0.1");
+        BOOL bindAll = NO;   // 偏好 debugBindAll=1 ⇒ 4321 也监听所有网卡（WLAN 直连，token 鉴权）
+        {
+            CFStringRef domain = CFSTR("com.tanyou.opendebug.settings");
+            CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("debugBindAll"), domain);
+            if (v && [(__bridge id)v isKindOfClass:[NSNumber class]]) bindAll = [(__bridge NSNumber *)v boolValue];
+            if (v) CFRelease(v);
+        }
+        a.sin_addr.s_addr = bindAll ? htonl(INADDR_ANY) : inet_addr("127.0.0.1");
         a.sin_port = htons(4321);
         if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
             NSLog(@"[TANConsole] bind失败"); close(s); return;

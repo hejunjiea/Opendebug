@@ -8,6 +8,13 @@
 	<!-- roothide 的 dpkg 安装时会把它改写成 <jbroot>/usr/bin/odebugd（与 frida-server 的 plist 同理） -->
 	<key>Program</key>
 	<string>/usr/bin/odebugd</string>
+	<!-- WLAN 直连模式：同网段电脑可直接连 <手机IP>:4322（凭 token 鉴权）。
+	     只想用数据线时改成 127.0.0.1 并 kickstart 重启 daemon 即可。 -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ODEBUGD_BIND</key>
+		<string>0.0.0.0</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
