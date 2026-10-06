@@ -4,6 +4,8 @@
 //
 
 #import "TANDebugVCDump.h"
+#import <sys/socket.h>
+#import <netinet/in.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 
@@ -121,6 +123,32 @@ static BOOL tan_hasVisibleUI(void) {
     return tan_topViewController(w.rootViewController) != nil;
 }
 
+/// 把 dump 文本回传给 odebugd(4322)（WLAN 下 Mac 没有 idevicesyslog，靠这个通道显示）
+/// 异步后台发，失败静默（daemon 不在也无所谓，syslog 里仍有 NSLog 的那份）
+static void tan_sendVcDumpToDaemon(NSString *text) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        struct sockaddr_in a = {0};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(4322);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        struct timeval tv = {2, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
+            NSString *msg = [NSString stringWithFormat:@"VCDUMP %@\n", text];
+            const char *p = msg.UTF8String;
+            size_t left = strlen(p);
+            while (left > 0) {
+                ssize_t w = write(fd, p, left);
+                if (w <= 0) break;
+                p += w; left -= w;
+            }
+        }
+        close(fd);
+    });
+}
+
 /// Darwin 通知回调：把当前进程的视图树打印到 syslog（[open] 前缀，供 idevicesyslog grep）
 /// 只响应前台且有 UI 的 App，避免后台进程（如 mapspushd）产生噪音。
 /// 同步执行（不 dispatch_async 主队列）——后台挂起的 App 主队列不跑，同步才能打印。
@@ -131,6 +159,7 @@ static void tan_dumpVCNotification(CFNotificationCenterRef c, void *observer, CF
     NSString *tree = TANVCDumpKeyWindowToString();
     NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"?";
     NSLog(@"[open] /VCDump [%@]:\n%@", bid, tree);
+    tan_sendVcDumpToDaemon([NSString stringWithFormat:@"VCDump [%@]:\n%@", bid, tree]);
 }
 
 /// Darwin 通知回调：只打印最上层控制器（类名 + 内存地址），只响应前台且有 UI 的 App
@@ -141,6 +170,7 @@ static void tan_dumpVCTopNotification(CFNotificationCenterRef c, void *observer,
     NSString *s = tan_topViewControllerPlainString();   // 不带颜色（syslog 里 ANSI 会乱码）
     NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"?";
     NSLog(@"[open] /VCDumpTop [%@]:\n%@", bid, s);
+    tan_sendVcDumpToDaemon([NSString stringWithFormat:@"VCDumpTop [%@]:\n%@", bid, s]);
 }
 
 /// dump 单个类的完整结构（继承/协议/属性/实例方法/类方法）

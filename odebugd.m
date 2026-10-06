@@ -75,7 +75,7 @@ static NSString *odbgDefaultPluginPath(void) {
 static NSString *gLogPath = nil;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.146";
+static NSString *gVersion = @"1.0.148";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -2320,13 +2320,42 @@ static NSString *helpText(void) {
         @"  !restart            自杀重启 daemon（launchd KeepAlive 拉起）\n"
         @"  !sys                系统与服务信息\n"
         @"  !net                网络状态：绑定模式 + 手机各网卡 IP（WLAN 直连用）\n"
+        @"  !vclog [秒]        读系统日志里的 VCDump（WLAN 下看目标 App 视图树，默认 20 秒）\n"
         @"  !log [n]            看 odebugd 自己的日志（默认 40 行）\n"
         @"  !exit               断开本连接\n", gVersion, getpid()];
 }
 
+/// 视图树回传环形缓冲：App 侧 ODebug.dylib 连 4322 发 "VCDUMP <文本>"，!vclog 读这里
+/// （iOS 17 无 /usr/bin/log，os_log 无法命令行读；idevicesyslog 又依赖 USB）
+static pthread_mutex_t gVcLock = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableString *gVcDump = nil;
+static void odbgVcDumpAppend(NSString *s) {
+    pthread_mutex_lock(&gVcLock);
+    if (!gVcDump) gVcDump = [NSMutableString string];
+    [gVcDump appendFormat:@"\n--- %@ ---\n%@\n",
+        [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                      dateStyle:NSDateFormatterShortStyle
+                                      timeStyle:NSDateFormatterMediumStyle], s];
+    // 上限 256KB，超过砍头
+    if (gVcDump.length > 262144) {
+        [gVcDump deleteCharactersInRange:NSMakeRange(0, gVcDump.length - 262144)];
+    }
+    pthread_mutex_unlock(&gVcLock);
+}
+
+/// !vclog：返回收集到的视图树回传（WLAN 下 Mac 没有 idevicesyslog，mobile ssh 读
+/// os_log 又被权限挡 ⇒ App 侧直接回传到 4322，daemon 落在环形缓冲里）
+static NSString *cmdVcLog(NSString *arg) {
+    (void)arg;
+    pthread_mutex_lock(&gVcLock);
+    NSString *r = gVcDump ?: @"";
+    pthread_mutex_unlock(&gVcLock);
+    if (!r.length) return @"（还没有任何回传。先在前台打开目标 App，再发 !front / !vcapp top，然后 !vclog）";
+    return [NSString stringWithFormat:@"%@", r];
+}
+
 /// !net：网络状态——当前绑定模式 + 各网卡 IP（WLAN 直连要连哪个地址一目了然）
-static NSString *netInfo(void) {
-    NSMutableString *r = [NSMutableString stringWithFormat:
+static NSString *netInfo(void) {    NSMutableString *r = [NSMutableString stringWithFormat:
         @"odebugd 端口 %d，绑定 %@%@\n",
         gPort, gBindAny ? @"0.0.0.0（WLAN 直连开启）" : @"127.0.0.1（仅本机）",
         gBindAny ? @"：同网段电脑直连 手机IP:4322，凭 token 鉴权" : @"：设置页开「WLAN 直连」或 !bind 后 !restart"];
@@ -2532,6 +2561,10 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!tp "]) return cmdTaskProbe([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!sys"]) return systemInfo();
     if ([cmd isEqualToString:@"!net"]) return netInfo();
+    if ([cmd hasPrefix:@"!vclog"]) {
+        NSString *a = [cmd length] > 6 ? [cmd substringFromIndex:7] : @"";
+        return cmdVcLog(a);
+    }
     if ([cmd hasPrefix:@"!log"]) return tailLog([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!token"]) return @"";
     return [NSString stringWithFormat:@"未知命令: %@（发 help 看菜单）\n", cmd];
@@ -2666,6 +2699,13 @@ static void clientLoop(int fd) {
             line = trim(line);
             if (line.length == 0) continue;
             NSString *cmd = line;
+            if ([[line uppercaseString] hasPrefix:@"VCDUMP "]) {
+                // 注入到目标 App 的 ODebug.dylib 回传视图树（免 token：内容只是视图树文本，
+                // 且来自本机 App；WLAN 下 Mac 没有 idevicesyslog，走这条路显示）
+                odbgVcDumpAppend([line substringFromIndex:7]);
+                write(fd, "ok\n", 3);
+                continue;
+            }
             if ([[line uppercaseString] hasPrefix:@"AUTH "]) {
                 NSArray *parts = [line componentsSeparatedByString:@" "];
                 if (parts.count < 3) continue;

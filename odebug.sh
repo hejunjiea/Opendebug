@@ -257,13 +257,19 @@ send() {
                 | { [ -n "$filter" ] && grep "$filter" || cat; } \
                 | tail -40
         elif [ -n "$logfile" ]; then
-            # Mac：等 App 响应 + idevicesyslog 抓到；只显示 App 的 [open] /VCDump，过滤 SpringBoard 自身日志
+            # Mac+USB：等 App 响应 + idevicesyslog 抓到；只显示 App 的 [open] /VCDump，过滤 SpringBoard 自身日志
             sleep 3
             kill $_PID 2>/dev/null
             grep -E "\[open\] /VCDump|Top:|keyWindow" "$logfile" 2>/dev/null \
                 | { [ -n "$filter" ] && grep "$filter" || cat; } \
                 | head -40
             rm -f "$logfile"
+        elif [ "$HOST" != "127.0.0.1" ]; then
+            # WLAN 直连：没有 USB 就没有 idevicesyslog ⇒ 走 odebugd(4322) 的 !vclog（root 读 os_log）
+            local vout
+            vout=$(printf "AUTH $TOKEN !vclog 25\n" | nc -w 30 "$HOST" 4322 2>/dev/null \
+                | grep -v "odebugd" | grep -v "输入 help")
+            if [ -n "$filter" ]; then echo "$vout" | grep "$filter"; else echo "$vout"; fi
         fi
     fi
 
