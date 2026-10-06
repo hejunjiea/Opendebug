@@ -35,20 +35,14 @@ TOKEN_FILE="$HOME/.odebug_token"
 HOST=${ODEBUG_HOST:-127.0.0.1}
 PORT=${ODEBUG_PORT:-4321}
 
-# ── 傻瓜式端口选择（1.0.144）：直接运行脚本时弹菜单选 4321/4322；设了 ODEBUG_PORT/ODEBUG_HOST 则跳过 ──
-if [ -z "$ODEBUG_PORT" ] && [ -t 0 ]; then
-    echo ""
-    echo "  ═══ 连接哪个控制台？ ═══"
-    echo "   1) 插件控制台 4321（默认）── 视图树/类/内存/沙箱文件（能力最强）"
-    echo "   2) 守护进程 odebugd 4322 ── 注入!fd/看门狗!auto/!net/救援!safe（安全模式也不失联）"
-    printf '%s' "  选择 [1]: "
-    read -r _pick
-    case "$_pick" in
-        2) PORT=4322 ;;
-        *) PORT=4321 ;;
-    esac
-    echo "  → 已选择端口 $PORT"
-fi
+# ── 端口切换（1.0.144）：默认直接进 4321；会话里按 x 在 4321 ⇄ 4322 之间互切 ──
+switch_port() {
+    if [ "$PORT" = "4321" ]; then PORT=4322; else PORT=4321; fi
+    echo "↔️  已切换到 $([ "$PORT" = "4321" ] && echo "插件控制台 4321" || echo "odebugd 守护进程 4322")"
+    ensure_tunnel >/dev/null 2>&1
+    if port_up; then echo "✅ $HOST:$PORT 已连通"; else echo "⚠️  $HOST:$PORT 暂时连不上（可能目标没在监听/需等 WLAN 发现）"; fi
+    menu
+}
 
 
 # ── 端口转发（只在电脑上跑时需要）──────────────────────────────────────────
@@ -354,6 +348,7 @@ menu() {
         sec "救援"
         row m "!safe off" "退出安全模式(救援)"
         row h "help" "帮助(全部命令)"
+        row x "切换⇄4321" "切到插件控制台(视图树/类/内存)"
         row 0 "exit" "退出"
         echo -e "  ${C_D}4321 专属(!vc/!class/!dump/!eval…)在这里不可用——那些在插件控制台里${C_R}\n"
         return
@@ -394,6 +389,7 @@ menu() {
     row v "!eval [方法]" "调用方法"
     row g "!grep <kw>" "过滤上一条输出"
     row m "!safe on|off" "进/出安全模式(禁用全部插件)"
+    row x "切换⇄4322" "切到 odebugd 守护进程(注入/看门狗/救援)"
     row h "help" "帮助"
     row 0 "exit" "退出"
 
@@ -407,6 +403,7 @@ while true; do
     case "$input" in
         0) echo "再见"; exit 0;;
         h|H|help) send "help"; menu;;
+        x|X) switch_port;;
         clear|cls) clear; menu;;
         *) if [ "$PORT" = "4322" ]; then
                # ── 4322 守护进程：快捷键映射到 daemon 命令 ──
