@@ -181,9 +181,24 @@ AUTH <令牌> <命令>
 | `!grep <关键词>` | 过滤**上一条命令**的输出（重放+只显示匹配行，对任何命令有效，如先 `!ivars 0x...` 再 `!grep shortcut`） |
 | `!safe on` | **进入安全模式（禁用全部插件）**：写标记 `<jbroot>/var/mobile/.eksafemode` + respring（只清 SpringBoard） |
 | `!safe on all` | 写标记 + `jbctl reboot_userspace`：**所有进程**都不再注入 tweak（约 30-60 秒，会杀光 App） |
-| `!safe off` | 删掉安全模式标记（配 `!safe respring` 恢复注入） |
+| `!safe off` | 先删掉安全模式标记，再强制结束 SpringBoard（退出安全模式） |
+| `!safe off all` | 先确认安全模式标记删除成功，再重启整个用户空间 |
 | `!safe respring` | 只重启 SpringBoard |
 | `!safe status` | 查安全模式状态（标记 / 软链 / 退出办法） |
+| `!ureboot confirm` | 重启用户空间；不修改安全模式标记，也不重启整机 |
+
+4322 守护进程菜单中，`o` 会进入安全模式并重启用户空间；`m` 会打开安全模式向导：
+
+```text
+1  进入安全模式（只重启 SpringBoard）
+2  进入安全模式并重启整个用户空间
+3  退出安全模式（只重启 SpringBoard）
+4  退出安全模式并重启整个用户空间
+5  只重启 SpringBoard（不修改安全模式标记）
+s  查看状态
+```
+
+4322 主菜单按 `b` 也可以直接重启 SpringBoard，执行前会再次确认；该操作不会修改安全模式标记，也不会重启整机或用户空间。
 | `help` / `?` | 显示完整命令菜单 |
 
 > **`!vc top` 实战**：拿到地址后可继续 `!class <控制器类名>` 看它的属性/方法，
@@ -434,7 +449,26 @@ python3 -c "import socket;s=socket.create_connection(('127.0.0.1',4321));print(s
 |------|------|
 | `!auto status \| on \| off \| run` | **安全模式自动兜底**（默认开）：把 `ODebug.dylib` 自动注入 SpringBoard |
 | `!inject <pid\|springboard> [dylib]` | 手动注入（默认 `ODebug.dylib`；会先探依赖，必要时先注 `libellekit`） |
-| `!safe status \| on \| on all \| off \| respring` | 安全模式开关（与插件侧同语义） |
+| `!safe status \| on \| on all \| off \| off all \| respring` | 安全模式开关；`off all` 先删标记、确认成功后重启用户空间 |
+| `!ureboot confirm` | 只执行 `launchctl reboot userspace`；所有 App 和用户级进程会结束，但 BootSessionID 应保持不变 |
+| `!layout status` | 定位 SpringBoard 实际使用的 `RecentAppLayouts.pb.lzfse`、`RecentAppLayouts.pb`、`SBRecentAppLayouts.plist` |
+| `!layout clean` | 把找到的布局缓存逐项改名为同目录 `.rescue-backup-yyyyMMdd-HHmmss`；全部移动和校验成功后，仅执行 `launchctl reboot userspace` |
+| `!re module [pid\|springboard] [过滤]` | 复刻模块取证；4321 查当前已注入进程，4322 可跨进程检查 SpringBoard/App |
+| `!re classes [过滤]` / `!re class <类名>` | 当前进程 Objective-C 类和类结构 |
+| `!re ivars <地址> [all]` / `!re vc [top]` | 对象 ivar 与进程内视图层级 |
+| `!re selector [-|+] <对象\|类> <selector>` | 只读 selector 的 owner、IMP、类型编码，不调用方法；类名目标默认实例优先再回退类方法，`-` 强制实例方法、`+` 强制类方法，并输出 `requestedKind` / `methodKind` |
+| `!re invoke0 <对象\|类> <selector>` | 调用无参数 BOOL getter，并明确输出 `boolValue=0/1`；其他返回类型拒绝调用 |
+| `!re snapshot <对象> <ivar>` | 只读单 ivar 的类型、偏移、原始字节和对象值 |
+| `!re addr <模块> <0x地址\|+0x偏移>` | strip PAC 后换算模块基址、运行时地址和 IDA 偏移 |
+| `!re ui [过滤] [--depth N] [--max N] [--compact] [--no-constraints]` | 输出可限制深度、节点数和约束的结构化 UIKit JSON；合并 scene windows 与 `UIApplication.windows`，按对象身份去重以纳入独立 overlay 窗口 |
+| `!re frida <模块> <偏移> <selector>` | 按 IDA 偏移生成待审阅的 Frida Interceptor 脚本 |
+| `!re hook\|intercept <类> <selector>` | 通过 `MSHookMessageEx` 安装签名白名单内的 log-only hook |
+| `!re trace add\|list\|log\|remove\|clear` | 管理调用跟踪；`--ttl` 的绝对过期时间会跨 SpringBoard/用户空间重启保存 |
+| `!re mem read\|patch\|patches\|undo` | 带映射检查的读取、可逆单字节补丁和旧值账本 |
+| `!re evidence begin\|input\|status\|end\|stat\|read` | 记录场景，并支持分块读取超过 512 KB 的 JSON |
+| `!re evidence crash [数量]` | 关联最近 SpringBoard/Jetsam/backboardd 崩溃及布局、TweakInject 特征 |
+| `!replica status\|begin\|quarantine\|rollback` | 复刻文件快照、可逆隔离和恢复 |
+| `!rescue diagnose\|plan\|apply` | 白屏/白苹果诊断、一次性计划和用户空间救援 |
 | `!ps [过滤]` / `!ls <路径>` / `!cat <路径>` / `!plist read <路径>` | 进程与文件（`!ps` 是安全模式下唯一能看进程列表的途径：`/bin/ps` 在设备上不可用） |
 | `!imgs <pid> [过滤]` / `!sym <pid> <镜像> <符号>` | 列目标进程镜像 / 调 `dlsym` 解析远端符号 |
 | `!tp <pid>` | 可行性探针：`task_for_pid` + 远端 `mach_vm_allocate/protect/write` + `task_threads` |
@@ -442,7 +476,502 @@ python3 -c "import socket;s=socket.create_connection(('127.0.0.1',4321));print(s
 | `!hj <pid> write [文本]` / `!hj <pid> open <路径>` | 单步验证：劫持一个线程调 `write` / `dlopen` |
 | `!exec <pid> [code\|nop\|clone\|raw\|lib]` | 远端线程状态实验台（验证 PAC 约定、匿名页取指等） |
 | `!spawn <路径> [参数]` | 起一次性进程（注入靶子） |
+| `!run [--timeout <秒>] <路径> [参数]` | 前台执行并捕获 stdout、stderr 与退出码（默认 20 秒，上限 120 秒） |
 | `!sys` / `!log [n]` / `!exit` | 系统信息 / 自己的日志 / 断开 |
+
+`!layout clean` 不会删除布局文件，也不会改 `IconState.plist` 或安全模式标记。它先排除 `/var`、`/private/var`、`/rootfs` 与当前 jbroot 路径视图指向的同一 inode，再尝试时间戳改名；已有同名备份时自动追加 `-2`、`-3`。只要任一目标移动或校验失败，本次已经移动的文件会按相反顺序回滚，并且不会重启用户空间。所有文件都成功备份后才调用 `launchctl reboot userspace`，绝不调用整机 `reboot`、`shutdown` 或结束 SpringBoard。4322 菜单中按 `z` 可直接进入该功能，选择 `clean` 时需要再次确认。`!layout status`、`!layout clean` 和 `!sys` 都会显示 `BootSessionID`；正常重启用户空间后该值保持不变，如果变化则说明整机启动链发生了变化。
+
+`!re` 的基础取证命令在目标进程内直接读取 Objective-C runtime、dyld 和视图树；4322 的 `!re module` 通过 `task_for_pid` 只读取远端镜像表。`selector` 和 `snapshot` 不会调用 selector、修改内存或安装 hook。证据会话最多保留 4 MiB，单条记录最多 1 MiB，超出后会明确标记截断。
+
+`!re hook`、`!re intercept`、`!re trace` 和 `!re mem patch` 会改变目标进程状态，属于高风险操作。hook 沿用 `TANHookConsole` 的 ARM64 ABI 签名白名单和纯 C 日志路径，不认识的签名会拒绝安装。调用日志包含全局 `seq`、线程标识、参数、double 和返回值。`!re mem patch` 只写一个字节，并且先检查地址是否映射、只读页能否 `vm_protect`；每次写入都会保存旧值到进程内账本。
+
+地址换算示例：
+
+```text
+!re addr TrollOpenRe.dylib 0x10449a204
+!re addr TrollOpenRe.dylib +0x9a204
+```
+
+输出同时包含 `loadAddress`、`canonicalImplementation`、`runtimeAddress` 和 `idaOffset`。`!re selector` 现在也会自动附带 IMP 对应的 `loadAddress` 与 `idaOffset`。同名 selector 同时存在于实例和类方法面时，可显式查询：
+
+```text
+!re selector -NSObject description
+!re selector +NSObject description
+```
+
+结构化 UI 示例：
+
+```text
+!re ui
+!re ui RBDynamicIsland
+!re ui RBDynamicIsland --depth 12 --max 400 --compact --no-constraints
+```
+
+输出为 `odebug-re-ui-v1` JSON，包含 UIView 类、地址、frame、bounds、hidden、alpha、背景色、layer 圆角/边框、label 字体和颜色、image 尺寸、view controller、subviews 顺序以及 Auto Layout constraints。
+
+过滤模式会包含匹配节点及其完整子树。`--compact` 去除缩进、对象地址和冗余默认字段；`--no-constraints` 移除约束数组；`--depth` 和 `--max` 分别限制深度与输出节点数。JSON 同时返回 `visitedCount` 和 `truncated`，用于判断结果是否完整。
+
+Frida 模板生成示例：
+
+```text
+!re frida TrollOpenRe.dylib 0x9a204 -[TOJBClass001 method:]
+```
+
+生成的脚本只作为文件内容返回，不会自动执行。它使用 `Module.getBaseAddress` 和 `Interceptor.attach`，并附带 enter/leave 及全局 sequence。
+
+### 原版/复刻版差分采集
+
+原版和复刻版必须分别加载、分别采集，第一次不要同时启用，避免两套 hook 相互覆盖。每次使用相同的场景名、输入和命令顺序：
+
+```text
+!re evidence begin notification-card
+!re evidence input title=Message
+!re evidence input message=Body
+!re evidence input icon=AppIcon
+!re evidence input appName=Demo
+!re module TrollOpen
+!re vc top
+!re selector 0x对象地址 preferredEdgeOutsetsForLayoutMode:
+!re snapshot 0x对象地址 layoutMode
+!re evidence end
+```
+
+`end` 会返回类似 `/var/mobile/Library/Preferences/ODebugRE/20261121-...-notification-card.json` 的证据文件。用 `!cat <路径>` 取出 JSON，分别保存为 `original.json` 和 `replica.json`。
+
+大型 evidence 使用分块读取：
+
+```text
+!re evidence stat
+!re evidence read 0x0 262144
+!re evidence read 0x40000 262144
+```
+
+`read` 返回一行 JSON，`data` 为 base64，并包含 `offset`、`length`、`size` 和 `eof`。场景执行器会自动使用此协议，失败时才回退到 `!cat`。
+
+宿主机使用差分工具：
+
+```sh
+./tools/odebug_re_compare.py original.json replica.json \
+  --scenario tools/odebug_re_scenario.template.json \
+  --out diff-report.json
+```
+
+工具会忽略 PID、时间戳、BootSessionID、ASLR slide、IMP 和对象地址等易变内容，按原来的命令顺序比较输入、类、selector、尺寸、状态和视图输出。退出码：
+
+- `0`：归一化后的证据一致。
+- `1`：存在已确认差异。
+- `3`：缺少必需输入/命令或证据被截断，结果标为“待证实”。
+
+默认不使用数值容差放行。尺寸或约束不一致会进入 `differences`；无法形成完整证据的项目会进入 `pending`，发布验收时不能把 `pending` 当作通过。
+
+调用顺序的采集示例：
+
+```text
+!re evidence begin notification-card-trace
+!re evidence input title=Message
+!re trace add RBDynamicIslandNotificationLayoutProvider152 preferredEdgeOutsetsForLayoutMode: --ttl 60
+触发一次通知卡展示
+!re trace log 200
+!re trace remove RBDynamicIslandNotificationLayoutProvider152 preferredEdgeOutsetsForLayoutMode:
+!re evidence end
+```
+
+紧急恢复全部 hook：
+
+```text
+!re trace clear
+```
+
+它等价于 `!hook clear`，会遍历所有活跃槽位并使用 hook 前保存的原始 IMP 恢复，同时清除持久化 hook 列表。
+
+内存补丁示例：
+
+```text
+!re mem read 0x地址 32
+!re mem patch 0x地址 0x01
+!re mem patches
+!re mem undo 1
+!re mem undo all
+```
+
+补丁编号只在当前进程内有效，进程退出或 SpringBoard 重启后账本清空，不能跨进程恢复。
+
+### 自动化与差分工具
+
+场景执行器：
+
+```sh
+./tools/odebug_re_run.py scenario.json \
+  --host 192.168.46.224 \
+  --port 4321 \
+  --token-file /private/path/odebug-token \
+  --out-dir analysis/replica-notification-card
+```
+
+它会按顺序执行 `!re evidence begin`、场景输入、观测命令和 `!re evidence end`，保存 `transcript.json` 与 `evidence.json`。先用 `--dry-run` 可以只检查命令计划。
+
+设置键接线审计：
+
+```sh
+./tools/odebug_re_settings_audit.py \
+  ReplicaProject/Resources/AnimationSettings.plist \
+  --source producer=ReplicaProject/Prefs \
+  --source reader=ReplicaProject/Sources \
+  --expect-domain com.example.replica.originals \
+  --expect-notification com.example.replica-updated \
+  --out analysis/settings-audit.json
+```
+
+工具递归提取 plist 中带 `key` 的设置项，再以 `producer`/`reader` 角色扫描
+`.h/.m/.mm/.xm`。输出把声明键分为 `WIRED`、`UNWIRED`、`UI_ONLY` 和 `RUNTIME_ONLY`，
+同时核对显式传入的偏好域与 Darwin 通知是否同时出现在设置端和运行端。对
+`<base>.mass`、`<base>.stiffness`、`<base>.damping` 这类由
+`SpringPreset`/`SpringParam` 动态拼接的键，会根据 reader 中的 base 字符串
+建立派生引用。注释里的键名、域和通知名会被忽略。
+
+只有已由原版二进制或调用链证明“仅用于设置页过滤、占位或生成运行时值”的键，
+才通过可重复的 `--ui-only-key <key>` 显式标记为 `UI_ONLY`。未被 plist 声明的
+`UI_ONLY` 键会让工具失败，避免把拼错或真实漏接线的配置键隐藏掉。
+
+同一个项目可把 plist、producer/reader、通道和 UI-only 证据保存到 profile：
+
+```sh
+./tools/odebug_re_settings_audit.py \
+  --profile /path/to/project/tools/settings-audit-profile.json \
+  --out analysis/settings-audit.json
+```
+
+Profile 内分路径相对 profile 文件所在目录解析。格式为：
+
+```json
+{
+  "schema": "odebug-re-settings-profile-v1",
+  "plists": ["../Prefs/Root.plist"],
+  "sources": {
+    "producer": ["../Prefs"],
+    "reader": ["../Sources"]
+  },
+  "expectedDomains": ["com.example.replica.originals"],
+  "expectedNotifications": ["com.example.replica-updated"],
+  "uiOnlyKeys": {
+    "placeholderKey": "original UI-only evidence"
+  }
+}
+```
+
+退出码：`0` 表示没有未接线键或通道不一致；`1` 表示需要处理。扫描单个设置页
+时，其他页面消费者的键会出现在 `RUNTIME_ONLY` 中作为信息展示，不会单独导致
+失败。该工具是静态证据：动态计算出的键仍应使用 `!re trace` 在目标进程做一次
+针对性确认，不能把静态 `WIRED` 当成运行时效果已经被真机验证。
+
+截图差分：
+
+```sh
+./tools/odebug_re_image_diff.py original.png replica.png \
+  --crop 20,80,360,120 \
+  --threshold 0 \
+  --out image-diff.json \
+  --overlay image-diff.bmp
+```
+
+工具通过 macOS `sips` 读取 PNG/JPEG，输出变化像素数、比例、平均绝对误差和变化区域；退出码 `0` 表示一致，`1` 表示存在像素差异。
+
+覆盖率报告：
+
+```sh
+idat64 -A -S"tools/ida_re_export.py --out analysis/ida-selectors.json" \
+  TrollOpenRe.dylib.i64
+
+./tools/odebug_re_coverage.py \
+  --original original.json \
+  --replica replica.json \
+  --implemented implemented-selectors.json \
+  --ida analysis/ida-selectors.json \
+  --out coverage.json \
+  --csv coverage.csv
+```
+
+状态包括 `verified`、`implemented-not-tested`、`missing-in-replica`、`unimplemented` 和 `pending`。只有原版与复刻版都实际观察到、并且实现清单中存在对应 selector 时，才会标记为 `verified`。
+
+### 复刻安装事务和救机计划
+
+安装复刻文件前记录原文件快照：
+
+```text
+!replica begin TrollOpenRe \
+  /var/jb/Library/MobileSubstrate/DynamicLibraries/TrollOpenRe.dylib \
+  /var/jb/Library/MobileSubstrate/DynamicLibraries/TrollOpenRe.plist
+!replica status
+```
+
+安装完成后标记本次 replica 进入 active：
+
+```text
+!replica finish
+```
+
+安装后出现崩溃循环时可以先隔离：
+
+```text
+!replica quarantine
+```
+
+需要恢复安装前的原文件：
+
+```text
+!replica rollback
+```
+
+所有操作都保留原文件、隔离文件和 rollback preimage，不直接删除。
+
+救机流程采用两阶段一次性计划：
+
+```text
+!rescue diagnose
+!rescue plan quarantine
+!rescue apply <plan-id>
+```
+
+可用 action：
+
+- `layout`：可逆备份 SpringBoard 布局缓存。
+- `quarantine`：隔离 replica manifest 中的复刻文件。
+- `rollback`：恢复安装前快照。
+- `safe`：写入安全标记。
+
+计划 300 秒过期、只能消费一次，并记录创建时的 BootSessionID 和诊断结果。apply 成功后才触发 `launchctl reboot userspace`。
+
+宿主机安装守护器：
+
+```sh
+./tools/odebug_replica_guard.py \
+  --host 192.168.46.168 \
+  --name TrollOpenRe \
+  --path /var/jb/Library/MobileSubstrate/DynamicLibraries/TrollOpenRe.dylib \
+  --path /var/jb/Library/MobileSubstrate/DynamicLibraries/TrollOpenRe.plist \
+  --deb package.deb \
+  --watch-seconds 180 \
+  --auto-rescue \
+  --token-file /private/path/odebug-token
+```
+
+守护器监控 SpringBoard PID、4321、4322 和 MCP 8099；超过 PID 变化阈值或插件端口离线超过 grace period 时，自动创建并执行 `quarantine` 救援计划。先加 `--dry-run` 可查看计划。
+
+### IDA-first 复刻工作区
+
+只使用电脑 IDA 时，可以完成静态接口、调用图、常量和复刻覆盖率，不依赖手机在线。
+
+导出增强版 IDA evidence：
+
+```sh
+idat64 -A \
+  -S"tools/ida_re_export.py --include-strings \
+      --out analysis/ida-evidence.json" \
+  -Lanalysis/ida-export.log \
+  analysis/original-plugin.i64
+```
+
+导出内容包含类、selector、地址、IDA offset、prototype、callers/callees、引用字符串、立即数、hook API xref 和字符串。对 `MSHookMessageEx`、`class_replaceMethod` 等固定 class/selector 参数，导出器会沿 ARM64 寄存器赋值恢复 `targetClass`、`targetSelector` 和 `targetKind`；运行期传入动态 `Method` 的 exchange 无法静态确定目标类时会保留为空，不以猜测补全。`__imp__` 导入桩不会计为真实 hook 调用。
+
+布局候选会记录 `CGRectMake`、`CGPointMake`、`CGSizeMake`、`UIEdgeInsetsMake`、字体、圆角和 constraint API，以及方法内立即数。
+
+扫描复刻源码：
+
+```sh
+./tools/odebug_source_scan.py ReplicaProject \
+  --out analysis/source-evidence.json
+```
+
+如果复刻类为避免冲突使用 `Replica` 后缀：
+
+```sh
+./tools/odebug_source_scan.py ReplicaProject \
+  --strip-suffix Replica \
+  --out analysis/source-evidence.json
+```
+
+也可多次使用 `--map OriginalClass=ReplicaClass` 做显式映射。默认仅扫描 `.m/.mm/.xm`，并排除 `Evidence`、`Package`、`ReferencePackage`、`Tests`、`.theos` 和构建目录。
+批量映射可写成 `{"maps":{"OriginalClass":"ReplicaClass"}}` 并通过
+`--map-file` 传入。生成计划时可加
+`--built-dependencies-dir .theos/obj/debug/arm64e`：只有出现在编译器
+`.Td` 依赖中的源码/头文件才算 `built`，存在但未编入产物的方法会标记为
+`source-not-built`。
+扫描实现时还会合并跨行 Objective-C selector，并从已实现类的头文件记录
+`@property` 自动合成的 getter/setter；category 中的 property 不会被误算为
+自动合成。纯内存管理访问器会与真实布局/业务方法区分，避免把 ivar offset
+误报成待补代码。
+
+合并 IDA 与源码，生成可执行工作队列：
+
+```sh
+./tools/odebug_replication_plan.py \
+  --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --out analysis/replication-plan.json \
+  --markdown analysis/replication-plan.md
+```
+
+Markdown 报告只列出按类聚合的缺口和前 100 个工作项；完整工作队列保留在 JSON。
+
+生成只含 selector、类型注释和 IDA evidence 的 ObjC 骨架：
+
+```sh
+./tools/odebug_skeleton.py \
+  --ida analysis/ida-evidence.json \
+  --out analysis/generated-skeleton
+```
+
+比较两版 IDA evidence 的 selector 和调用边：
+
+```sh
+./tools/odebug_ida_diff.py \
+  --original analysis/original-ida.json \
+  --replica analysis/replica-ida.json \
+  --out analysis/ida-diff.json
+```
+
+检查复刻源码是否保留了有效证据标签：
+
+```sh
+./tools/odebug_evidence_lint.py \
+  --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --out analysis/evidence-lint.json
+```
+
+只想检查 IDA 中原版方法的证据标签时：
+
+```sh
+./tools/odebug_evidence_lint.py \
+  --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --ignore-not-in-ida \
+  --out analysis/evidence-lint-focused.json
+```
+
+发现缺失、未知 offset 或 IDA 中不存在的方法时返回退出码 `1`。
+
+根据 IDA evidence 自动生成注释补丁，默认只写 `.patch` 文件：
+
+```sh
+./tools/odebug_evidence_patch.py \
+  --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --patch analysis/evidence.patch \
+  --report analysis/evidence-patch-report.json \
+  --only-required
+```
+
+确认补丁后加 `--apply` 才会修改源码。
+默认 diff 以 `source-evidence.json` 的 `sourceRoot` 为基准生成 `a/...`、
+`b/...` 相对路径，可直接从目标仓库根目录执行 `git apply --check`；源码根不在
+evidence 中时可用 `--patch-root` 明确指定。
+
+提取复刻源码的 Objective-C message callgraph：
+
+```sh
+./tools/odebug_source_callgraph.py \
+  --source analysis/source-evidence.json \
+  --out analysis/source-callgraph.json
+```
+
+把 ODebug 运行时 evidence 注释回 IDA：
+
+```sh
+idat64 -A \
+  -S"tools/ida_odebug_import.py \
+      --evidence analysis/runtime-evidence.json \
+      --report analysis/ida-import.json" \
+  -Lanalysis/ida-import.log \
+  analysis/replica.i64
+```
+
+工具按 `imageBase + idaOffset` 定位函数，追加 repeatable comment，并尽可能设置颜色。不会自动重命名函数。
+
+批量导出指定类的 Hex-Rays 伪代码：
+
+```sh
+./tools/odebug_ida.py pseudocode \
+  --db analysis/original-plugin.i64 \
+  --evidence analysis/ida-evidence.json \
+  --class TOJBClass012 \
+  --class DIMiniElement \
+  --out analysis/pseudocode-priority
+```
+
+每个方法会生成独立 `.c` 文件，文件开头保留 IDA offset 和
+`Class selector` 证据标签；`manifest.json` 记录类、selector、运行时地址、
+IDA offset、成功状态、失败原因，以及输入二进制和 evidence 的 SHA256。
+提供 `--evidence` 时只导出其中匹配的方法，适合按
+`replication-plan.json` 的缺口类分批处理。默认排除 `.cxx_*`、
+`__deallocating__`、`__destroy_helper_block_` 和
+`__copy_helper_block_` 等编译器生成符号；只有确需检查这些符号时才加
+`--include-compiler-generated`。伪代码是待核对的静态证据，不能仅凭文本相似
+就判定原版与复刻版行为一致。
+
+统一入口：
+
+```sh
+./tools/odebug_ida.py export \
+  --db analysis/original-plugin.i64 \
+  --out analysis/ida-evidence.json \
+  --include-strings
+
+./tools/odebug_ida.py import-runtime \
+  --db analysis/replica.i64 \
+  --evidence analysis/runtime-evidence.json \
+  --report analysis/ida-import.json
+
+./tools/odebug_ida.py pseudocode \
+  --db analysis/original-plugin.i64 \
+  --evidence analysis/ida-evidence.json \
+  --class TOJBClass012 \
+  --out analysis/pseudocode-priority
+./tools/odebug_ida.py scan ReplicaProject --out analysis/source-evidence.json
+./tools/odebug_ida.py scan ReplicaProject --strip-suffix Replica \
+  --out analysis/source-evidence.json
+./tools/odebug_ida.py plan --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --out analysis/replication-plan.json
+./tools/odebug_ida.py skeleton --ida analysis/ida-evidence.json \
+  --out analysis/generated-skeleton
+./tools/odebug_ida.py diff --original original.json --replica replica.json \
+  --out analysis/ida-diff.json
+./tools/odebug_ida.py lint --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --ignore-not-in-ida \
+  --out analysis/evidence-lint.json
+./tools/odebug_ida.py patch-evidence --ida analysis/ida-evidence.json \
+  --source analysis/source-evidence.json \
+  --patch analysis/evidence.patch \
+  --report analysis/evidence-patch-report.json \
+  --only-required
+./tools/odebug_ida.py callgraph --source analysis/source-evidence.json \
+  --out analysis/source-callgraph.json
+./tools/odebug_ida.py coverage --ida analysis/ida-evidence.json \
+  --implemented analysis/source-evidence.json \
+  --out analysis/coverage.json
+```
+
+没有设备 evidence 时，静态结果只能达到 `implemented`、`implemented-not-tested`、`missing` 和 `pending`。`verified` 仍要求原版与复刻版的运行时证据。
+
+安装前的 deb 静态验收：
+
+```sh
+./tools/ios_package_preflight.py \
+  --deb packages/com.example.package.deb \
+  --expect-id com.example.package \
+  --expect-version 1.2.3-4 \
+  --expect-arch iphoneos-arm64e \
+  --require-rpath @loader_path/.jbroot/Library/Frameworks \
+  --require-rpath @loader_path/.jbroot/usr/lib \
+  --require-string notificationIslandEnabled \
+  --out analysis/package-preflight.json
+```
+
+工具会检查 Debian 归档成员、control、解包结果、动态库和 Preferences
+bundle 的 arm64e 架构、CodeDirectory、`ldid` 可读性、rpath、Tweak
+filter plist 以及指定的关键字符串。它不会安装或运行包。
 
 ### 自动兜底是怎么工作的
 
@@ -618,3 +1147,43 @@ A: 控制台还是旧代码，重启 SpringBoard 让新 dylib 生效（`killall 
 原因：本地缓存的 Token 与手机端不一致。
 
 解决：运行 rm ~/.odebug_token，然后重新启动 ./odebug.sh 抓取最新 Token，或前往手机设置里手动输入。
+
+### USB 救援诊断
+
+手机已经启用 iDownload 时，可指定设备 UDID 和通过设备证据确认的当前 jbroot，执行只读诊断：
+
+```sh
+python3 tools/usb_rescue_status.py --udid <UDID> --jbroot /private/var/containers/Bundle/Application/.jbroot-<标识>
+```
+
+脚本使用仅监听本机的 USB 转发，读取身份、launchd 任务、两个安全模式路径和 daemon 日志；默认只读。追加 `--start` 会请求 bootstrap 已安装的 odebugd 并打印结果；不改动标记、不重启设备。已有任务时 bootstrap 可能返回已加载，需以 launchd 状态及端口连接为准。安全模式标记存在时，odebugd 暂停向 SpringBoard 自动注入；手动 `!auto run` 同样拒绝执行。独立控制端口是否可用仍需现场验证。
+
+
+多台手机选择：普通运行 `./odebug.sh` 会自动扫描局域网；发现多台时显示设备名、IP、端口和版本供选择，单台则直接连接。指定 `ODEBUG_HOST=<IP>` 时直连该地址；`ODEBUG_CHOOSE=1` 可强制显示选择列表。
+
+### 早期救援服务
+
+本节已按 Relaxin `main` 的公开快照 `f44e0acfef4453989381736e0c86b9c14e7ea045` 核对，不再沿用 Dopamine/RootHide 的行为推断：
+
+- `Vendor/Dopamine/BaseBin/launchdhook/src/daemon_hook.m` 只把 jbroot 的 `basebin/LaunchDaemons` 注入 launchd 扫描结果，不扫描 `Library/LaunchDaemons`。
+- `RelaxinEngine/Bootstrap/RLXBaseBinInstaller.m` 安装 BaseBin 时先删除整个 `basebin` 目录，再解包；同时把 `basebin/LaunchDaemons/*.plist` 中 `ProgramArguments` 的 `@JBROOT@` 原地展开为真实 jbroot。这个快照不生成 `__Patched` 字段。
+- `Vendor/Dopamine/BaseBin/jbctl/src/internal.m` 的 `jbctl internal startup` 会随后执行 `launchctl bootstrap system /Library/LaunchDaemons`。
+- `com.aapl.relaxin.startup.plist` 使用 `Interactive`、`RunAtLoad=true`，并通过 `ProgramArguments` 调用 `@JBROOT@/basebin/jbctl internal startup`。
+
+因此救援采用两个不同 Label，而不是把同一个 job 放进两个目录：
+
+1. `com.tanyou.odebug-rescue` 位于 `basebin/LaunchDaemons`，由 `launchdhook` 最早注入 launchd。它每 60 秒检查一次 `odebugd`。
+2. `com.tanyou.odebug-rescue-repair` 位于 `Library/LaunchDaemons`，会随 Relaxin startup 的 `bootstrap system` 启动。它每 300 秒检查 BaseBin 早期 plist；BaseBin 升级把它整体删除后，它会从 `usr/share/odebugd` 的模板补回，并注册早期 job。
+
+两个 job 共用同一套救援逻辑，但 LaunchDaemon 不直接调用 shell 脚本：包内的原生 `usr/libexec/odebug_rescue_launcher` 会扫描当前 `.jbroot-*`，设置 `ODEBUG_RESCUE_JBROOT`，再用该 jbroot 的 shell 执行 `usr/libexec/odebug-rescue`。这样既不依赖 iOS 真实根中不存在的 `/bin/sh`，也能跨 BaseBin 随机化继续工作。真机对照测试确认：`/var/jb/usr/libexec/odebug_rescue_launcher` 可被 launchd 正常执行；同一程序即使签名有效，只要放在 `/var/mobile/Library/Logs/`，launchd 就会返回 `78 EX_CONFIG`。安装时 postinst 会先用设备自带 `ldid` 重签 launcher，再 `bootout` 缓存的旧救援 job 并 `bootstrap` 新 plist，确保新的 ProgramArguments 立即进入 launchd。脚本先解析 `launchctl print` 的实际生效域，核对 `state = running`、PID 仍存活，并用原生 launcher 的 `--probe-port 4322` 检查回环端口。若 job 完全未注册，依次执行 `bootstrap system`、`bootstrap user/501`，最后才尝试旧式 `launchctl load -w`。若 job 已注册但 PID 或端口不健康，只对 `com.tanyou.odebugd` 执行服务级 `kickstart -k`；仍未恢复时才对该服务 `bootout` 并重新 bootstrap。恢复尝试默认写入 300 秒冷却，避免 launchd 每分钟重复拉起造成风暴。该路径不注入 SpringBoard、不修改 `.safe_mode`/`.eksafemode`，也不重启 SpringBoard、设备或用户空间。
+
+安装后可在设备 root shell 运行以下只读诊断：
+
+```sh
+/var/jb/usr/libexec/odebug_rescue_launcher --diagnose
+cat /var/mobile/Library/Logs/odebug-rescue.log
+```
+
+这个服务的边界必须明确：`launchdhook` 本身没有注入 launchd，或整个 Relaxin bootstrap 没启动时，rescue 也不可能运行；那种情况下仍要使用 iDownload/USB 根 shell。它负责恢复“`odebugd` job 丢失/尚未注册”“job 已注册但进程卡死或 4322 不监听”以及“BaseBin 更新删除了早期 rescue plist”的场景。
+
+`odebugd` 启动时仍会做一次模板恢复作为额外保护；Library 中的 repair job 负责解决 `odebugd` 自己未启动时无法自愈的循环依赖。Relaxin 的 `rerandomizeRoot:` 会整体改名 `.jbroot-*`，因此三个 rescue plist 的 `ProgramArguments` 使用 Relaxin 维护的稳定兼容路径 `/var/jb/usr/libexec/odebug_rescue_launcher`，而不是固化当前随机 jbroot 名。原生 launcher 自己会扫描真实 `.jbroot-*` 定位 `odebugd`、`launchctl` 和 plist。安装维护脚本会尝试把两个 rescue job 注册到 `system` 域。注册失败不会触发 respring，Relaxin 下一次 startup 仍会扫描 Library 中的 repair job。

@@ -23,15 +23,17 @@ exec 2>&1
 
 # ODebug 调试控制台傻瓜式脚本
 # 在设备上运行（roothide），自动读取调试令牌，交互式菜单 + 数字快捷键
-# 用法: ./odebug.sh
+# 用法: ./odebug.sh（自动发现；多台手机时显示选择列表）
 #
 # 原理：用 bash /dev/tcp 连设备回环 127.0.0.1:4321（控制台只绑本机回环）。
 # 每条命令开一次连接发送，read -t 超时检测响应结束（控制台交互式不自动断连）。
 
 PLIST=/var/mobile/Library/Preferences/com.tanyou.opendebug.settings.plist
 TOKEN_FILE="$HOME/.odebug_token"
+WIRE_TOOL="${ODEBUG_WIRE_TOOL:-$(cd "$(dirname "$0")" && pwd)/tools/odebug_wire_client.py}"
 # 端口/主机可覆盖：默认 4321=插件内控制台；ODEBUG_PORT=4322 连 odebugd 守护进程(!net/!fd/!safe/!auto…)；
-# WLAN 直连（1.0.142+，免数据线）：ODEBUG_HOST=192.168.0.107 ./odebug.sh（此时不起 iproxy）
+# WLAN 直连（1.0.142+，免数据线）：ODEBUG_HOST=192.168.46.224 ./odebug.sh（此时不起 iproxy）
+# 桌面端默认自动发现手机；也可用 ODEBUG_HOST 显式指定 IP。设备本机仍使用回环地址。
 HOST=${ODEBUG_HOST:-127.0.0.1}
 PORT=${ODEBUG_PORT:-4321}
 
@@ -76,8 +78,85 @@ console_alive() {
 # ① Bonjour(mDNS)：手机 WLAN 模式广播 _odebugd._tcp.，dns-sd 解析；
 # ② UDP 信标：手机每 5 秒向 255.255.255.255:4323 发 ODEBUGD_BEACON，这里监听 7 秒抓一次。
 # （ODEBUG_NO_BONJOUR=1 跳过自动发现）
+scan_odebugd_lan() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$PORT" <<'PYSCAN'
+import concurrent.futures, ipaddress, socket, subprocess, sys
+ports = sorted({int(sys.argv[1]), 4321, 4322})
+try:
+    local = subprocess.check_output(['/usr/sbin/ipconfig','getifaddr','en0'], text=True).strip()
+    mask = subprocess.check_output(['/usr/sbin/ipconfig','getoption','en0','subnet_mask'], text=True).strip()
+    network = ipaddress.ip_network(f'{local}/{mask}', strict=False)
+except Exception:
+    raise SystemExit(1)
+# Prefer live neighbors already known to macOS; fall back to the local subnet.
+targets = {local}
+try:
+    arp = subprocess.check_output(['/usr/sbin/arp','-an'], text=True, stderr=subprocess.DEVNULL)
+    import re
+    for line in arp.splitlines():
+        match = re.search(r'\(([0-9.]+)\) at ([0-9a-f:]+)', line, re.I)
+        if match and match.group(2).lower() != '(incomplete)':
+            address = ipaddress.ip_address(match.group(1))
+            if address in network:
+                targets.add(str(address))
+except Exception:
+    pass
+
+def probe(item):
+    ip, port = item
+    try:
+        with socket.create_connection((str(ip), port), timeout=.7) as sock:
+            sock.settimeout(.5)
+            data = sock.recv(512).decode('utf-8','replace').replace('\n',' ').replace('\r',' ').strip()
+        if 'ODebug' not in data and 'odebugd' not in data.lower():
+            return None
+        import re
+        pid = re.search(r'pid (\d+)', data)
+        name = f'iPhone（进程ID {pid.group(1)}）' if pid else 'iPhone'
+        return f'{ip}|{name}|{port}'
+    except Exception:
+        return None
+def scan(addresses):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        return [x for x in pool.map(probe, ((ip, port) for ip in addresses for port in ports)) if x]
+rows = scan(sorted(targets, key=lambda x: int(ipaddress.ip_address(x))))
+if not rows:
+    rows = scan((str(ip) for ip in network.hosts()))
+for row in sorted(set(rows)):
+    print(row)
+PYSCAN
+}
+
 discover_odebugd() {
-    # ① Bonjour
+    # ② UDP 信标：手机每 5 秒广播 `ODEBUGD_BEACON <ip> <port> <版本>`，抓一行解析出 IP
+    if command -v nc >/dev/null 2>&1; then
+        local tmp2; tmp2=$(mktemp)
+        ( nc -ul -p 4323 > "$tmp2" 2>/dev/null ) &
+        local p2=$!
+        sleep 7
+        kill "$p2" 2>/dev/null
+        local rows=$(grep -aoE 'ODEBUGD_BEACON ([0-9]{1,3}\.){3}[0-9]{1,3} [0-9]+ [^[:space:]]+ [^[:space:]]+' "$tmp2" | awk '!seen[$2 ":" $3]++ {print $6 "|" $2 "|" $3 "|" $5}')
+        rm -f "$tmp2"
+        if [ -n "$rows" ]; then
+            local count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+            echo "发现局域网中的 ODebug 手机：" >&2
+            local i=1 row
+            while IFS= read -r row; do IFS='|' read -r name ip port version <<< "$row"; printf '  %d) %s  %s:%s  ODebug %s\n' "$i" "$name" "$ip" "$port" "$version" >&2; i=$((i+1)); done <<< "$rows"
+            printf '  m) 手动输入 IP\n  0) USB/自动选择\n选择手机（单台直接回车）: ' >&2
+            local choice; read -r choice
+            if [ "$count" -eq 1 ] && { [ -z "$choice" ] || [ "$choice" = "0" ]; }; then
+                printf '%s\n' "$rows" | head -1 | cut -d'|' -f2; return 0
+            elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+                printf '%s\n' "$rows" | sed -n "${choice}p" | cut -d'|' -f2
+                return 0
+            elif [ "$choice" = "m" ] || [ "$choice" = "M" ]; then
+                printf '输入手机 IP: ' >&2; read -r bip; printf '%s\n' "$bip"; return 0
+            fi
+            return 1
+        fi
+    fi
+    # Bonjour 回退：仅发现单台时自动连接
     if command -v dns-sd >/dev/null 2>&1; then
         local tmp; tmp=$(mktemp)
         dns-sd -L odebugd _odebugd._tcp local. > "$tmp" 2>/dev/null &
@@ -88,26 +167,87 @@ discover_odebugd() {
         rm -f "$tmp"
         [ -n "$ip" ] && { echo "$ip"; return 0; }
     fi
-    # ② UDP 信标：手机每 5 秒广播 `ODEBUGD_BEACON <ip> <port> <版本>`，抓一行解析出 IP
-    if command -v nc >/dev/null 2>&1; then
-        local tmp2; tmp2=$(mktemp)
-        ( nc -lu 4323 > "$tmp2" 2>/dev/null ) &
-        local p2=$!
-        sleep 7
-        kill "$p2" 2>/dev/null
-        local bip=$(grep -aoE 'ODEBUGD_BEACON ([0-9]{1,3}\.){3}[0-9]{1,3} [0-9]+' "$tmp2" | head -1 | awk '{print $2}')
-        rm -f "$tmp2"
-        [ -n "$bip" ] && { echo "$bip"; return 0; }
-    fi
     return 1
 }
 
 ensure_tunnel() {
     [ -d /var/jb ] && return 0                 # 设备上运行：直连本机回环，无需转发
-    [ -n "$ODEBUG_HOST" ] && { console_alive && return 0; return 0; }  # WLAN 直连手机 IP
+    [ -n "$ODEBUG_HOST" ] && { console_alive && return 0; echo "⚠️ 指定设备 $HOST:$PORT 无响应"; return 1; }
+    # 默认先列出手机，避免残留 iproxy 把连接悄悄导向旧设备。
+    # ODEBUG_FAST=1 才复用现有隧道或缓存。
+    local cache="$HOME/.odebug_last_host"
+    if [ -n "$ODEBUG_CHOOSE" ] || [ -z "$ODEBUG_FAST" ]; then
+        local rows; rows=$(scan_odebugd_lan)
+        if [ -z "$rows" ]; then
+            local discovered; discovered=$(discover_odebugd)
+            [ -n "$discovered" ] && rows="$discovered|iPhone (Bonjour)|$PORT"
+        fi
+        local count=0
+        [ -n "$rows" ] && count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+        if [ "$count" -gt 0 ]; then
+            echo "发现可连接的 ODebug 手机："
+            local i=1 row ip name found_port
+            while IFS= read -r row; do IFS='|' read -r ip name found_port <<< "$row"; printf '  %d) %s  %s:%s\n' "$i" "$name" "$ip" "$found_port"; i=$((i+1)); done <<< "$rows"
+        else
+            echo "局域网扫描没有发现手机。请确认两台手机与 Mac 在同一 Wi-Fi，且目标端口已开启。"
+        fi
+        echo "  m) 手动输入手机 IP 和端口"
+        local usb_list=""
+        if command -v idevice_id >/dev/null 2>&1; then usb_list=$(idevice_id -l 2>/dev/null); fi
+        [ -n "$usb_list" ] && echo "  u) 选择 USB 设备"
+        printf '选择序号（q 取消）: '; local choice; read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+            local selected; selected=$(printf '%s\n' "$rows" | sed -n "${choice}p")
+            IFS='|' read -r HOST _selected_name PORT <<< "$selected"
+        elif [ "$choice" = "m" ] || [ "$choice" = "M" ]; then
+            printf '手机 IP: '; read -r HOST
+            printf '端口（4321 或 4322，默认 4322）: '; read -r found_port
+            PORT=${found_port:-4322}
+            [[ "$PORT" = "4321" || "$PORT" = "4322" ]] || { echo "❌ 端口只支持 4321 或 4322"; return 1; }
+        elif { [ "$choice" = "u" ] || [ "$choice" = "U" ]; } && command -v idevice_id >/dev/null 2>&1; then
+            [ -n "$usb_list" ] || { echo "❌ 没有 USB 设备"; return 1; }
+            echo "$usb_list" | awk '{printf "  %d) %s\n", NR, $0}'
+            printf '选择 USB 序号: '; read -r found_port
+            [[ "$found_port" =~ ^[0-9]+$ ]] && [ "$found_port" -ge 1 ] || return 1
+            UDID=$(printf '%s\n' "$usb_list" | sed -n "${found_port}p")
+            HOST=127.0.0.1
+            # A USB device may expose only 4322 (for example, SpringBoard is in
+            # safe mode and the in-process 4321 console never starts). Probe both
+            # device ports through separate USB forwards and select the first one
+            # that actually answers.
+            local candidate
+            for candidate in 4321 4322; do
+                PORT=$candidate
+                if [ -n "$TUNNEL_PID" ]; then
+                    kill "$TUNNEL_PID" 2>/dev/null
+                    TUNNEL_PID=""
+                fi
+                pkill -f "iproxy ${candidate}(:${candidate})?([[:space:]]|$)" >/dev/null 2>&1 || true
+                iproxy "$candidate:$candidate" -u "$UDID" >/dev/null 2>&1 &
+                TUNNEL_PID=$!
+                for _i in $(seq 1 20); do
+                    if console_alive; then
+                        echo "🔌 USB 已连接：$UDID → $PORT"
+                        return 0
+                    fi
+                    sleep .25
+                done
+            done
+            kill "$TUNNEL_PID" 2>/dev/null
+            TUNNEL_PID=""
+            echo "⚠️ USB 设备 $UDID 已找到，但 4321 和 4322 均无响应"
+            return 1
+        else
+            echo "已取消手机选择。"
+            return 1
+        fi
+        if [ "$HOST" != "127.0.0.1" ]; then echo "$HOST" > "$cache" 2>/dev/null; fi
+        console_alive && { echo "📱 已选择 $HOST:$PORT"; return 0; }
+        # A USB choice is handled and verified in the branch above.
+        echo "⚠️ 所选设备 $HOST:$PORT 无响应"; return 1
+    fi
     console_alive && return 0
     # ① 上次自动发现的 IP 先试（0.1s），别每次都重新走 9 秒发现流程
-    local cache="$HOME/.odebug_last_host"
     if [ -f "$cache" ]; then
         local hip; hip=$(cat "$cache" 2>/dev/null)
         if [ -n "$hip" ] && [ "$hip" != "$HOST" ]; then
@@ -171,8 +311,9 @@ get_token() {
 }
 
 TOKEN=$(get_token "$1")
+[ -f "$TOKEN_FILE" ] && chmod 600 "$TOKEN_FILE" 2>/dev/null   # 令牌等同 root 调试口令：新旧缓存文件都收紧为仅本人可读
 echo "✅ 调试令牌: $TOKEN (BASH=$BASH_VERSION)"
-ensure_tunnel || true
+if ! ensure_tunnel; then exit 1; fi
 
 # 发送单条命令并读取完整响应（环境变量传递避免引号/括号被 shell 二次解析）
 # 跨进程命令（!front / !vcapp）结果写在 syslog：Mac 上先启动 idevicesyslog 抓取再发命令，
@@ -231,28 +372,29 @@ send() {
     fi
     TUNNEL_OK=1
 
-    # 发送并捕获响应（过滤控制台欢迎语，避免每条命令重复显示）；!dump 遍历类 + 轮询，给更长超时
-    # 回环（iproxy）用 bash /dev/tcp；WLAN 直连用 nc——macOS 对 bash 直连局域网会话会被安全机制掐死
-    local timeout=2
-    case "$cmd" in *dump*) timeout=40;; esac
-    local output
-    if [ "$HOST" = "127.0.0.1" ]; then
-        output=$(TOKEN="$TOKEN" CMD="$cmd" TIMEOUT="$timeout" RHOST="$HOST" RPORT="$PORT" bash -c '
-            exec 3<>/dev/tcp/$RHOST/$RPORT
-            printf "AUTH $TOKEN $CMD\n" >&3
-            # 首行等满超时；之后 1 秒无新行即收工（连接不关也能立刻退出，不再干等 4 秒）
-            first=1
-            while true; do
-                if [ "$first" = 1 ]; then read -t $TIMEOUT line <&3 || break; first=0
-                else read -t 1 line <&3 || break; fi
-                echo "$line"
-            done
-            exec 3>&-
-        ' | grep -v "ODebug 调试控制台: 输入 help")
-    else
-        output=$(printf "AUTH $TOKEN $cmd\n" | nc -w $timeout "$HOST" "$PORT" \
-            | grep -v "ODebug 调试控制台: 输入 help" | grep -v "输入 help 看命令菜单")
+    if [ ! -f "$WIRE_TOOL" ]; then
+        echo "❌ 找不到协议客户端: $WIRE_TOOL（可用 ODEBUG_WIRE_TOOL 指定）"
+        return 1
     fi
+
+    # 1.0.181: 4322 在响应末尾发送结束标记，客户端收到即退出。旧 4321
+    # 控制台没有标记，则使用 0.35 秒静默回退，兼容同时消除旧的固定等待。
+    local timeout=20
+    case "$cmd" in
+        *dump*) timeout=45;;
+        "!fd "*) timeout=120;;
+        "!dld "*|"!pth "*|"!call "*|"!rx "*|"!inject "*) timeout=120;;
+    esac
+    local quiet="${ODEBUG_QUIET_TIMEOUT:-0.35}"
+    local output
+    if ! output=$(ODEBUG_WIRE_TOKEN="$TOKEN" ODEBUG_WIRE_COMMAND="$cmd" \
+        python3 "$WIRE_TOOL" --host "$HOST" --port "$PORT" \
+        --timeout "$timeout" --quiet "$quiet"); then
+        return 1
+    fi
+    output=$(printf '%s\n' "$output" \
+        | grep -v "ODebug 调试控制台: 输入 help" \
+        | grep -v "输入 help 看命令菜单")
     if [ -n "$filter" ]; then
         echo "$output" | grep "$filter"
     else
@@ -367,6 +509,30 @@ safemode_interactive() {
     esac
 }
 
+safemode_daemon_interactive() {
+    echo "安全模式向导："
+    echo "  1) 进入安全模式（只重启 SpringBoard）"
+    echo "  2) 进入安全模式并重启整个用户空间"
+    echo "  3) 退出安全模式（只重启 SpringBoard）"
+    echo "  4) 退出安全模式并重启整个用户空间"
+    echo "  5) 只重启 SpringBoard（不修改安全模式标记）"
+    echo "  s) 查看安全模式状态"
+    echo "  0) 返回主菜单"
+    printf '%s' "选择操作: "
+    local sm x
+    read -r sm
+    case "$sm" in
+        1) printf '%s' "确认进入安全模式并重启 SpringBoard? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe on";;
+        2) printf '%s' "确认进入安全模式并重启整个用户空间? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe on all";;
+        3) printf '%s' "确认退出安全模式并重启 SpringBoard? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe off";;
+        4) printf '%s' "确认退出安全模式并重启整个用户空间? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe off all";;
+        5) printf '%s' "确认只重启 SpringBoard（不修改安全模式标记）? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe respring";;
+        s|S) send "!safe status";;
+        0|q|Q|"") ;;
+        *) echo "❌ 无效选项，请重新选择";;
+    esac
+}
+
 menu() {
     # ANSI 颜色
     local C_G='\033[32m' C_C='\033[36m' C_B='\033[34m' C_Y='\033[33m'
@@ -377,11 +543,12 @@ menu() {
 
     if [ "$PORT" = "4322" ]; then
         # ── odebugd 守护进程菜单（4322 专属命令）──
-        echo -e "  ${C_BLD}${C_B}═══ odebugd 守护进程 (4322) ═══${C_R}  root 系统级控制台，安全模式也不失联\n"
+        echo -e "  ${C_BLD}${C_B}═══ odebugd 守护进程 (4322) ═══${C_R}  超级用户系统级控制台，安全模式也不失联\n"
         sec "注入 / 进程"
         row f "!fd <pid> <dylib>" "向任意进程注入 dylib"
         row i "!imgs <pid> [过滤]" "查进程镜像(验证注入)"
-        row s "!spawn <路径> [参数]" "root 起进程"
+        row s "!spawn <路径> [参数]" "以超级用户启动进程"
+        row t "!notify <name>" "发送 Darwin 通知"
         row p "!ps" "进程列表"
         sec "看门狗 / 网络"
         row a "!auto status" "看门狗(安全模式自动兜底)"
@@ -392,8 +559,18 @@ menu() {
         row c "!cat <路径>" "读文件"
         row d "!dpkg <deb路径>" "安装 deb(自更新链)"
         row r "!restart" "重启 odebugd"
+        sec "用户空间 / 救援"
+        row z "!layout status|clean" "可逆备份布局缓存并重启用户空间"
+        row w "!ureboot confirm" "重启用户空间（不修改安全模式）"
+        row b "!safe respring" "重启 SpringBoard（不修改安全模式）"
+        row o "!safe on all" "进入安全模式并重启用户空间"
+        row e "!safe off all" "退出安全模式并重启用户空间"
+        sec "复刻取证"
+        row q "!re module <进程ID|springboard>" "跨进程模块路径与加载地址"
         sec "救援"
-        row m "!safe off" "退出安全模式(救援)"
+        row j "!rescue diagnose|plan|apply" "白屏/白苹果诊断与一次性救援"
+        row k "!replica status|begin|..." "复刻快照、隔离和回滚"
+        row m "安全模式菜单" "数字选择进入/退出与重启范围"
         row h "help" "帮助(全部命令)"
         row x "切换⇄4321" "切到插件控制台(视图树/类/内存)"
         row 0 "exit" "退出"
@@ -430,11 +607,12 @@ menu() {
     row b "!bundle <bid>" "App信息"
     row e "!icon <bid>" "App图标"
     row d "!dump <bid>" "导出全部类"
-    row c "!icons" "list/hide/show"
+    row c "!icons" "列出/隐藏/显示图标"
 
     sec "高级"
     row v "!eval [方法]" "调用方法"
     row g "!grep <kw>" "过滤上一条输出"
+    row q "!re <子命令>" "复刻取证/JSON 证据"
     row m "!safe on|off" "进/出安全模式(禁用全部插件)"
     row x "切换⇄4322" "切到 odebugd 守护进程(注入/看门狗/救援)"
     row h "help" "帮助"
@@ -458,6 +636,7 @@ while true; do
                    f|F) printf '%s' "pid: "; read -r pid; printf '%s' "dylib路径: "; read -r dy; [ -n "$pid" ] && [ -n "$dy" ] && send "!fd $pid $dy";;
                    i|I) printf '%s' "pid(如 springboard/4321/self): "; read -r pid; printf '%s' "过滤词(可空): "; read -r kw; send "!imgs $pid $kw";;
                    s|S) printf '%s' "程序绝对路径: "; read -r p; printf '%s' "参数(可空): "; read -r args; send "!spawn $p $args";;
+                   t|T) printf '%s' "Darwin 通知名: "; read -r p; [ -n "$p" ] && send "!notify $p";;
                    p|P) send "!ps";;
                    a|A) printf '%s' "auto命令(status/on/off/run)[status]: "; read -r x; send "!auto ${x:-status}";;
                    n|N) send "!net";;
@@ -466,7 +645,15 @@ while true; do
                    c|C) printf '%s' "文件路径: "; read -r p; [ -n "$p" ] && send "!cat $p";;
                    d|D) printf '%s' "deb路径(设备上的): "; read -r p; [ -n "$p" ] && send "!dpkg $p";;
                    r|R) printf '%s' "确认重启 odebugd? (y/N): "; read -r x; [ "$x" = "y" ] && send "!restart";;
-                   m|M) printf '%s' "确认退出安全模式(删标记+重启SB)? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe off";;
+                   z|Z) printf '%s' "layout 命令(status/clean)[status]: "; read -r x; x=${x:-status}; if [ "$x" = clean ]; then printf '%s' "确认可逆备份布局缓存并重启用户空间? (y/N): "; read -r y; [ "$y" = "y" ] && send "!layout clean"; else send "!layout status"; fi;;
+                   w|W) printf '%s' "确认重启整个用户空间（不修改安全模式，不重启整机）? (y/N): "; read -r x; [ "$x" = "y" ] && send "!ureboot confirm";;
+                   b|B) printf '%s' "确认只重启 SpringBoard（不修改安全模式标记）? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe respring";;
+                   o|O) printf '%s' "确认进入安全模式并重启整个用户空间? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe on all";;
+                   e|E) printf '%s' "确认删除安全模式标记并重启整个用户空间? (y/N): "; read -r x; [ "$x" = "y" ] && send "!safe off all";;
+                   q|Q) printf '%s' "目标(pid/springboard): "; read -r p; printf '%s' "模块过滤词(可空): "; read -r kw; [ -n "$p" ] && send "!re module $p $kw";;
+                   j|J) printf '%s' "rescue命令(diagnose/plan/apply)[diagnose]: "; read -r x; send "!rescue ${x:-diagnose}";;
+                   k|K) printf '%s' "replica命令(status/begin/quarantine/rollback)[status]: "; read -r x; send "!replica ${x:-status}";;
+                   m|M) safemode_daemon_interactive;;
                    *) if [[ "$input" == \!* || "$input" == AUTH* || "$input" == "help" || "$input" == "?" ]]; then
                           send "$input"
                       else
@@ -498,6 +685,7 @@ while true; do
         y|Y) printf '%s' "plist路径: "; read -r p; printf '%s' "key: "; read -r k; printf '%s' "值: "; read -r val; [ -n "$p" ] && [ -n "$k" ] && send "!plist write $p $k $val";;
         v|V) printf '%s' "方法调用(如 [[TOJBClass001 m] m2]): "; read -r m; [ -n "$m" ] && send "!eval $m";;
         g|G) printf '%s' "关键词: "; read -r kw; [ -n "$kw" ] && send "!grep $kw";;
+        q|Q) printf '%s' "!re 子命令(如 classes Troll / evidence begin card): "; read -r m; [ -n "$m" ] && send "!re $m";;
         m|M) safemode_interactive;;
         c|C) printf '%s' "icons命令(list/hide <bundleId>/show): "; read -r x; [ -n "$x" ] && send "!icons $x";;
         *) if [[ "$input" == \!* || "$input" == AUTH* || "$input" == \[* || "$input" == "help" || "$input" == "?" ]]; then

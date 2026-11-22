@@ -23,6 +23,8 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "ODLayoutRescue.h"
+#import "ODRescueTransactions.h"
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -34,6 +36,7 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
+#include <notify.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -73,9 +76,10 @@ static NSString *odbgDefaultPluginPath(void) {
     return [gJbroot stringByAppendingString:@"/Library/MobileSubstrate/DynamicLibraries/ODebug.dylib"];
 }
 static NSString *gLogPath = nil;
+static time_t gStartedAt = 0;
 static int gPort = 4322;
 static int gBindAny = 0;   // 1 = 绑 0.0.0.0（WLAN 直连模式，靠 token 鉴权），默认只绑回环
-static NSString *gVersion = @"1.0.153";
+static NSString *gVersion = @"1.0.181";
 static volatile int gAutoInject = 1;                            // 安全模式兜底：自动把 ODebug.dylib 注入 SpringBoard
 static pthread_mutex_t gInjLock = PTHREAD_MUTEX_INITIALIZER;    // 同一时刻只允许一个注入（客户端 vs 看门狗）
 static volatile time_t gExpectedSbRestart = 0;                  // odebugd 自己 respring 的时刻：看门狗据此不把「按预期重启」当崩溃循环
@@ -183,6 +187,71 @@ static NSString *legacyMarkerPath(void) { return @"/var/mobile/.eksafemode"; }
 static NSString *markerLinkPath(void) {
     return [gJbroot stringByAppendingString:@"/basebin/.safe_mode"];
 }
+static NSString *earlyRescuePlistPath(void) {
+    return [gJbroot stringByAppendingString:@"/basebin/LaunchDaemons/com.tanyou.odebug-rescue.plist"];
+}
+static NSString *earlyRescueTemplatePath(void) {
+    return [gJbroot stringByAppendingString:@"/usr/share/odebugd/com.tanyou.odebug-rescue.plist"];
+}
+
+/// A basebin update replaces basebin/LaunchDaemons as a directory. Keep a patched
+/// copy under /usr/share and restore the early job for the next launchd start.
+static void restoreEarlyRescuePlist(void) {
+    NSString *source = earlyRescueTemplatePath();
+    NSString *target = earlyRescuePlistPath();
+    NSData *sourceData = [NSData dataWithContentsOfFile:source options:0 error:NULL];
+    if (!sourceData) {
+        applog(@"[rescue] 模板不存在，无法检查 basebin rescue: %@", source);
+        return;
+    }
+    NSData *targetData = [NSData dataWithContentsOfFile:target options:0 error:NULL];
+    NSString *targetText = targetData ? [[NSString alloc] initWithData:targetData encoding:NSUTF8StringEncoding] : nil;
+    if (targetText.length && ![targetText containsString:@"@JBROOT@"]) return;
+
+    NSString *text = [[NSString alloc] initWithData:sourceData encoding:NSUTF8StringEncoding];
+    if (!text.length) {
+        applog(@"[rescue] 模板不是 UTF-8 plist: %@", source);
+        return;
+    }
+    text = [text stringByReplacingOccurrencesOfString:@"@JBROOT@" withString:gJbroot];
+    NSData *out = [text dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *dir = [target stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSError *err = nil;
+    if (![out writeToFile:target options:NSDataWritingAtomic error:&err]) {
+        applog(@"[rescue] 恢复 basebin rescue 失败: %@", err.localizedDescription ?: @"unknown error");
+        return;
+    }
+    chown(target.UTF8String, 0, 0);
+    chmod(target.UTF8String, 0644);
+    applog(@"[rescue] 已恢复 basebin 早期救援 plist；下次 launchd 启动生效");
+}
+
+/// roothide 的 dpkg maintainer 脚本运行在 jbroot 视图里，`/var/mobile` 会被映射到
+/// `<jbroot>/var/mobile`。LaunchDaemon 运行在真实根视图里，因此由 root daemon 自己把
+/// rescue helper 再写到真实的 `/var/mobile/Library/Logs/`。该目录稳定存在，且不依赖 jbroot 随机名。
+static void installStableRescueHelper(void) {
+    NSString *source = [gJbroot stringByAppendingString:@"/usr/libexec/odebug_rescue_launcher"];
+    NSString *target = @"/var/mobile/Library/Logs/odebug-rescue";
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfFile:source options:0 error:&readError];
+    if (!data) {
+        applog(@"[rescue] 读取 helper 失败 %@: %@", source, readError.localizedDescription ?: @"unknown");
+        return;
+    }
+    NSData *current = [NSData dataWithContentsOfFile:target options:0 error:NULL];
+    if ([current isEqualToData:data]) {
+        chmod(target.UTF8String, 0755);
+        return;
+    }
+    NSError *writeError = nil;
+    if (![data writeToFile:target options:NSDataWritingAtomic error:&writeError]) {
+        applog(@"[rescue] 写入稳定 helper 失败 %@: %@", target, writeError.localizedDescription ?: @"unknown");
+        return;
+    }
+    chmod(target.UTF8String, 0755);
+    applog(@"[rescue] 稳定 helper 已更新: %@ (%lu bytes)", target, (unsigned long)data.length);
+}
 
 static NSString *trim(NSString *s) {
     return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -243,7 +312,7 @@ static NSString *allProcs(NSString *filter) {
     int shown = 0;
     for (size_t i = 0; i < n; i++) {
         NSString *comm = @(procs[i].kp_proc.p_comm);
-        NSString *line = [NSString stringWithFormat:@"%-6d uid=%-5d %@\n",
+        NSString *line = [NSString stringWithFormat:@"%-6d 用户ID=%-5d %@\n",
                           procs[i].kp_proc.p_pid, procs[i].kp_eproc.e_ucred.cr_uid, comm];
         if (filter.length && ![comm.lowercaseString containsString:filter.lowercaseString]) continue;
         [out appendString:line];
@@ -266,6 +335,162 @@ static NSString *listDir(NSString *path) {
         [out appendFormat:@"%@\n", describePath([path stringByAppendingPathComponent:e])];
     }
     [out appendFormat:@"共 %lu 项\n", (unsigned long)entries.count];
+    return out;
+}
+
+#pragma mark - SpringBoard 布局缓存救援
+
+/// 只执行用户空间重启。布局救援模块负责“先全部改名并校验成功”，
+/// 这个函数只在 ODLayoutClean 成功移动全部目标后被调用。
+static int spawnUserspaceReboot(NSString **detail) {
+    NSArray<NSString *> *candidates = @[
+        [gJbroot stringByAppendingString:@"/basebin/launchctl"],
+        [gJbroot stringByAppendingString:@"/usr/bin/launchctl"],
+        @"/var/jb/bin/launchctl",
+        @"/bin/launchctl",
+        @"/usr/bin/launchctl",
+    ];
+    NSString *launchctl = nil;
+    for (NSString *candidate in candidates) {
+        if (candidate.length && access(candidate.UTF8String, X_OK) == 0) {
+            launchctl = candidate;
+            break;
+        }
+    }
+    if (!launchctl) {
+        if (detail) *detail = @"❌ 找不到可执行的 launchctl；布局备份已保留，未重启用户空间";
+        return ENOENT;
+    }
+
+    const char *argv[] = {launchctl.UTF8String, "reboot", "userspace", NULL};
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, argv[0], NULL, NULL, (char *const *)argv, environ);
+    if (detail) {
+        *detail = [NSString stringWithFormat:@"%@ %@ 重启用户空间（返回码=%d，进程ID=%d）",
+                   rc == 0 ? @"已启动" : @"启动失败", launchctl, rc, pid];
+    }
+    return rc;
+}
+
+static NSString *layoutCacheTimestamp(void) {
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyyMMdd-HHmmss";
+    return [formatter stringFromDate:[NSDate date]];
+}
+
+static NSString *bootSessionIdentifier(void) {
+    size_t size = 0;
+    if (sysctlbyname("kern.bootsessionuuid", NULL, &size, NULL, 0) != 0 ||
+        size < 2 || size > 256) {
+        return @"不可用";
+    }
+    char value[257] = {0};
+    if (sysctlbyname("kern.bootsessionuuid", value, &size, NULL, 0) != 0) {
+        return @"不可用";
+    }
+    value[MIN(size, sizeof(value) - 1)] = '\0';
+    return [NSString stringWithUTF8String:value] ?: @"不可用";
+}
+
+static NSString *layoutFileTypeLabel(NSString *type) {
+    if ([type isEqualToString:NSFileTypeRegular]) return @"普通文件";
+    if ([type isEqualToString:NSFileTypeSymbolicLink]) return @"符号链接";
+    if ([type isEqualToString:NSFileTypeDirectory]) return @"目录";
+    return type ?: @"未知";
+}
+
+static BOOL safeModeMarkersAbsent(void) {
+    return access(markerPath().UTF8String, F_OK) != 0 &&
+           access(legacyMarkerPath().UTF8String, F_OK) != 0;
+}
+
+static NSString *cmdUserspaceReboot(NSString *arg) {
+    NSString *a = trim(arg).lowercaseString;
+    if (![a isEqualToString:@"confirm"]) {
+        return @"⚠️ 用户空间重启会结束所有 App 和用户级进程，但不会重启整机。\n"
+               @"确认执行请发送: !ureboot confirm\n";
+    }
+    NSString *before = bootSessionIdentifier();
+    NSString *detail = nil;
+    int rc = spawnUserspaceReboot(&detail);
+    if (rc != 0) {
+        return [NSString stringWithFormat:
+            @"❌ 用户空间重启启动失败（返回码=%d）\n%@\nBootSessionID: %@\n",
+            rc, detail ?: @"launchctl 未返回详细信息", before];
+    }
+    return [NSString stringWithFormat:
+        @"✅ 已请求重启用户空间\n%@\n"
+        @"重启前 BootSessionID: %@\n"
+        @"约 20-30 秒后重新连接；BootSessionID 应保持不变，改变则表示发生了整机重启。\n",
+        detail, before];
+}
+
+static NSString *cmdLayout(NSString *arg) {
+    NSString *action = trim(arg).lowercaseString;
+    if (action.length == 0) action = @"status";
+    if (![action isEqualToString:@"status"] && ![action isEqualToString:@"clean"]) {
+        return @"用法: !layout status | !layout clean\n"
+               @"clean 只把已知布局缓存同目录改名为 .rescue-backup-时间戳，逐项校验成功后才重启用户空间。\n";
+    }
+
+    NSArray<NSString *> *directories = ODLayoutCacheDirectories(gJbroot);
+    NSArray<NSString *> *names = ODLayoutCacheFileNames();
+    if ([action isEqualToString:@"status"]) {
+        NSDictionary *result = ODLayoutStatus(directories, names);
+        NSMutableString *out = [NSMutableString stringWithString:@"===== SpringBoard 布局缓存 =====\n"];
+        [out appendFormat:@"BootSessionID: %@\n", bootSessionIdentifier()];
+        for (NSDictionary *entry in result[@"entries"]) {
+            [out appendFormat:@"%@  [%@ %lluB]\n", entry[@"path"],
+                layoutFileTypeLabel(entry[@"type"]),
+                [entry[@"size"] unsignedLongLongValue]];
+        }
+        for (NSString *error in result[@"errors"]) [out appendFormat:@"❌ %@\n", error];
+        if ([result[@"entries"] count] == 0) {
+            [out appendString:@"未找到已知布局缓存文件\n"];
+        }
+        [out appendString:@"清理: !layout clean（同目录时间戳备份 + 重启用户空间）\n"];
+        return out;
+    }
+
+    NSDictionary *result = ODLayoutClean(directories, names, layoutCacheTimestamp(), spawnUserspaceReboot);
+    NSMutableString *out = [NSMutableString stringWithString:@"===== SpringBoard 布局缓存可逆清理 =====\n"];
+    NSString *bootSessionID = bootSessionIdentifier();
+    [out appendFormat:@"BootSessionID(清理前): %@\n", bootSessionID];
+    for (NSDictionary *move in result[@"moves"]) {
+        [out appendFormat:@"✅ %@ → %@\n", move[@"source"], move[@"backup"]];
+        applog(@"[layout] moved %@ to %@", move[@"source"], move[@"backup"]);
+    }
+    for (NSString *error in result[@"errors"]) [out appendFormat:@"❌ %@\n", error];
+    for (NSString *error in result[@"rollbackErrors"]) [out appendFormat:@"⚠️ %@\n", error];
+
+    if ([result[@"noFiles"] boolValue]) {
+        [out appendString:@"未找到可清理的 SpringBoard 布局缓存；未重启用户空间。\n"];
+        return out;
+    }
+    if ([result[@"errors"] count]) {
+        if ([result[@"rolledBack"] boolValue]) {
+            [out appendString:@"移动/校验失败；已回滚本次已移动文件，未重启用户空间。\n"];
+        } else {
+            [out appendString:@"移动/校验失败；未重启用户空间。请按上面的备份路径人工核对。\n"];
+        }
+        return out;
+    }
+    if (![result[@"rebootAttempted"] boolValue]) {
+        [out appendString:@"未执行用户空间重启。\n"];
+        return out;
+    }
+
+    int rc = [result[@"rebootRC"] intValue];
+    [out appendFormat:@"%@\n", result[@"rebootDetail"] ?: @"launchctl reboot userspace"];
+    if (rc == 0) {
+        [out appendFormat:
+            @"约 20-30 秒后设备回来；备份保留，可随时改名恢复。\n"
+            @"用户空间重启用后，!sys 里的 BootSessionID 应仍为 %@；若发生变化说明发生了整机重启。\n",
+            bootSessionID];
+    } else {
+        [out appendString:@"重启用户空间失败；布局缓存备份仍然保留。\n"];
+    }
     return out;
 }
 
@@ -302,16 +527,16 @@ static NSString *cmdSafe(NSString *arg) {
         pid_t sb = pidOfName("SpringBoard");
         BOOL linkDangling = (access(markerPath().UTF8String, F_OK) != 0);
         return [NSString stringWithFormat:
-            @"===== ODebug 安全模式（odebugd，root 视角）=====\n"
+            @"===== ODebug 安全模式（odebugd，超级用户视角）=====\n"
             @"jbroot: %@\n"
             @"标记文件(★注入器真正检查): %@\n"
             @"%@"
             @"注入软链: %@%@\n"
             @"真实路径(注入器不看，仅清理): %@\n"
-            @"SpringBoard pid: %d\n"
-            @"odebugd: pid %d, uid %d, 端口 %d\n"
-            @"说明: 本服务是 LaunchDaemon ⇒ 安全模式下照旧应答；插件内控制台(4321)则不可用。\n"
-            @"命令: !safe on | on all | off | respring | status\n",
+            @"SpringBoard 进程ID: %d\n"
+            @"odebugd: 进程ID %d，用户ID %d，端口 %d\n"
+            @"说明: 本服务是系统守护进程 ⇒ 安全模式下照旧应答；插件内控制台(4321)则不可用。\n"
+            @"命令: !safe on | on all | off | off all | respring | status\n",
             gJbroot, markerPath(),
             markerStatusLine(markerPath(), @"  当前"),
             markerLinkPath(), linkDangling ? @"  (悬空 ⇒ 等于没标记)" : @"  (指向标记文件)",
@@ -323,7 +548,7 @@ static NSString *cmdSafe(NSString *arg) {
         pid_t sb = pidOfName("SpringBoard");
         NSString *killed = @"SpringBoard 未找到（标记已写入，进程重启后生效）";
         if (sb > 0) {
-            killed = [NSString stringWithFormat:@"已 SIGKILL SpringBoard(pid %d) ⇒ 新 SpringBoard 起即安全模式", sb];
+            killed = [NSString stringWithFormat:@"已强制结束 SpringBoard（进程ID %d）⇒ 新进程启动后进入安全模式", sb];
             gExpectedSbRestart = time(NULL);   // 我们自己杀 SB ⇒ 告诉看门狗这是按预期重启，不是崩溃循环
             kill(sb, SIGKILL);
         }
@@ -332,14 +557,36 @@ static NSString *cmdSafe(NSString *arg) {
     if ([a isEqualToString:@"on all"] || [a isEqualToString:@"all"]) {
         NSString *err = nil;
         if (!writeMarker(@"!safe on all", &err)) return [NSString stringWithFormat:@"❌ %@\n", err];
-        NSString *lc = [gJbroot stringByAppendingString:@"/usr/bin/launchctl"];
-        const char *argv[] = {lc.UTF8String, "reboot", "userspace", NULL};
-        pid_t p = 0;
-        int rc = posix_spawn(&p, argv[0], NULL, NULL, (char *const *)argv, environ);
+        NSString *rebootDetail = nil;
+        int rc = spawnUserspaceReboot(&rebootDetail);
+        NSString *tail = rc == 0
+            ? @"约 20-30 秒后设备回来（所有 App 被杀，标记保留 ⇒ 全用户空间干净）。"
+            : @"用户空间重启启动失败；安全模式标记仍已写入。";
+        return [NSString stringWithFormat:@"✅ 标记已写入 %@\n%@\n%@\n",
+                markerPath(), rebootDetail, tail];
+    }
+    if ([a isEqualToString:@"off all"] || [a isEqualToString:@"exit all"]) {
+        int r1 = unlink(markerPath().UTF8String);
+        int r2 = unlink(legacyMarkerPath().UTF8String);
+        if (!safeModeMarkersAbsent()) {
+            return [NSString stringWithFormat:
+                @"❌ 安全模式标记删除失败，未重启用户空间。\n"
+                @"主标记删除返回码=%d，旧路径删除返回码=%d。\n",
+                r1, r2];
+        }
+        NSString *detail = nil;
+        int rc = spawnUserspaceReboot(&detail);
+        if (rc != 0) {
+            return [NSString stringWithFormat:
+                @"✅ 安全模式标记已删除\n"
+                @"❌ 用户空间重启启动失败（返回码=%d）\n%@\n",
+                rc, detail ?: @"launchctl 未返回详细信息"];
+        }
         return [NSString stringWithFormat:
-            @"✅ 标记已写入 %@\n%@ launchctl reboot userspace (rc=%d, pid=%d)\n"
-            @"约 20-30 秒后设备回来（所有 App 被杀，标记保留 ⇒ 全用户空间干净）。\n",
-            markerPath(), rc == 0 ? @"已启动" : @"启动失败", rc, p];
+            @"✅ 安全模式标记已删除（主标记返回码=%d，旧路径返回码=%d）\n"
+            @"%@\n"
+            @"约 20-30 秒后重新连接；App 与用户级进程会全部重新启动，整机未重启。\n",
+            r1, r2, detail];
     }
     if ([a isEqualToString:@"off"] || [a isEqualToString:@"exit"]) {
         int r1 = unlink(markerPath().UTF8String);
@@ -347,12 +594,12 @@ static NSString *cmdSafe(NSString *arg) {
         pid_t sb = pidOfName("SpringBoard");
         NSString *killed = @"SpringBoard 未找到";
         if (sb > 0) {
-            killed = [NSString stringWithFormat:@"已 SIGTERM SpringBoard(pid %d)", sb];
+            killed = [NSString stringWithFormat:@"已强制结束 SpringBoard（进程ID %d）", sb];
             gExpectedSbRestart = time(NULL);   // 同上：主动 respring 不计入崩溃循环
-            kill(sb, SIGTERM);
+            kill(sb, SIGKILL);
         }
         return [NSString stringWithFormat:
-            @"✅ 先删标记（<jbroot> 侧 unlink=%d，真实路径 unlink=%d），再重启 SpringBoard（规则 25 的顺序）\n%@\n",
+            @"✅ 已先删除标记（jbroot 路径返回码=%d，真实路径返回码=%d），再重启 SpringBoard（规则 25 的顺序）\n%@\n",
             r1, r2, killed];
     }
     if ([a isEqualToString:@"respring"]) {
@@ -360,9 +607,9 @@ static NSString *cmdSafe(NSString *arg) {
         if (sb <= 0) return @"SpringBoard 未找到\n";
         gExpectedSbRestart = time(NULL);       // 同上：主动 respring 不计入崩溃循环
         kill(sb, SIGKILL);
-        return [NSString stringWithFormat:@"已 SIGKILL SpringBoard(pid %d)（标记未动）\n", sb];
+        return [NSString stringWithFormat:@"已强制结束 SpringBoard（进程ID %d），安全模式标记未修改\n", sb];
     }
-    return [NSString stringWithFormat:@"未知命令: !safe %@（可用 on / on all / off / respring / status）\n", arg];
+    return [NSString stringWithFormat:@"未知命令: !safe %@（可用 on / on all / off / off all / respring / status）\n", arg];
 }
 
 #pragma mark - 注入器可行性探针（task_for_pid / 远程 VM / 远程线程）
@@ -1706,6 +1953,101 @@ static NSString *cmdImages(NSString *arg) {
     return out;
 }
 
+/// !re 的跨进程部分只提供模块取证；对象和视图检查必须在已注入目标的 4321 内执行。
+static NSString *cmdRE(NSString *arg) {
+    NSString *value = trim(arg);
+    NSRange separator = [value rangeOfString:@" "];
+    NSString *subcommand = separator.location == NSNotFound ? value : [value substringToIndex:separator.location];
+    NSString *rest = separator.location == NSNotFound ? @"" : trim([value substringFromIndex:separator.location + 1]);
+    if ([subcommand.lowercaseString isEqualToString:@"module"]) {
+        if (!rest.length) return @"用法: !re module <pid|springboard> [过滤词]\n";
+        return [@"[re.module]\n" stringByAppendingString:cmdImages(rest)];
+    }
+    return @"4322 的 !re 只提供跨进程 module 取证。\n"
+           @"需要 classes/class/ivars/vc/selector/snapshot 时，请把 ODebug 注入目标进程后用 4321。\n"
+           @"例: !re module springboard TrollOpen\n";
+}
+
+static NSString *odbgJSONText(NSDictionary *value) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:value
+        options:NSJSONWritingSortedKeys error:NULL];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"{}";
+}
+
+static NSString *cmdReplica(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    parts = [parts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    NSString *action = parts.count ? parts[0].lowercaseString : @"status";
+    NSString *error = nil;
+    if ([action isEqualToString:@"status"]) {
+        return [odbgJSONText(ODReplicaStatus(gJbroot)) stringByAppendingString:@"\n"];
+    }
+    if ([action isEqualToString:@"begin"]) {
+        if (parts.count < 3) {
+            return @"用法: !replica begin <名称> <文件路径> [文件路径...]\n";
+        }
+        NSArray<NSString *> *paths = [parts subarrayWithRange:NSMakeRange(2, parts.count - 2)];
+        NSDictionary *manifest = ODReplicaSnapshotPaths(parts[1], paths, gJbroot, &error);
+        return manifest
+            ? [[odbgJSONText(manifest) stringByAppendingString:@"\n"] mutableCopy]
+            : [NSString stringWithFormat:@"❌ %@\n", error ?: @"snapshot failed"];
+    }
+    if ([action isEqualToString:@"quarantine"]) {
+        NSString *detail = nil;
+        NSDictionary *manifest = ODReplicaQuarantine(gJbroot, &detail, &error);
+        return manifest
+            ? [NSString stringWithFormat:@"✅ %@\n%@\n", detail ?: @"quarantined",
+               odbgJSONText(manifest)]
+            : [NSString stringWithFormat:@"❌ %@\n", error ?: @"quarantine failed"];
+    }
+    if ([action isEqualToString:@"finish"] || [action isEqualToString:@"activate"]) {
+        NSDictionary *manifest = ODReplicaMarkActive(gJbroot, &error);
+        return manifest
+            ? [NSString stringWithFormat:@"✅ replica active\n%@\n", odbgJSONText(manifest)]
+            : [NSString stringWithFormat:@"❌ %@\n", error ?: @"activate failed"];
+    }
+    if ([action isEqualToString:@"rollback"]) {
+        NSString *detail = nil;
+        NSDictionary *manifest = ODReplicaRollback(gJbroot, &detail, &error);
+        return manifest
+            ? [NSString stringWithFormat:@"✅ %@\n%@\n", detail ?: @"rolled back",
+               odbgJSONText(manifest)]
+            : [NSString stringWithFormat:@"❌ %@\n", error ?: @"rollback failed"];
+    }
+    return @"用法: !replica status | begin <名称> <路径...> | finish | quarantine | rollback\n";
+}
+
+static NSString *cmdRescue(NSString *arg) {
+    NSArray<NSString *> *parts = [trim(arg) componentsSeparatedByString:@" "];
+    parts = [parts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    NSString *action = parts.count ? parts[0].lowercaseString : @"diagnose";
+    NSString *error = nil;
+    if ([action isEqualToString:@"diagnose"] || [action isEqualToString:@"status"]) {
+        return [odbgJSONText(ODRescueDiagnose(gJbroot)) stringByAppendingString:@"\n"];
+    }
+    if ([action isEqualToString:@"plan"]) {
+        NSString *planAction = parts.count > 1 ? parts[1] : @"";
+        NSDictionary *plan = ODRescueCreatePlan(gJbroot, planAction, &error);
+        return plan
+            ? [NSString stringWithFormat:@"✅ rescue plan 已创建\n%@\n",
+               odbgJSONText(plan)]
+            : [NSString stringWithFormat:@"❌ %@\n", error ?: @"plan failed"];
+    }
+    if ([action isEqualToString:@"apply"]) {
+        if (parts.count < 2) return @"用法: !rescue apply <plan-id>\n";
+        NSString *detail = nil;
+        NSDictionary *plan = ODRescueApplyPlan(gJbroot, parts[1], &detail, &error);
+        if (!plan) return [NSString stringWithFormat:@"❌ %@\n", error ?: @"apply failed"];
+        NSString *rebootDetail = nil;
+        int rc = spawnUserspaceReboot(&rebootDetail);
+        return [NSString stringWithFormat:
+            @"%@ rescue plan %@ 已执行: %@\n%@\n%@\n",
+            rc == 0 ? @"✅" : @"⚠️", parts[1], detail ?: @"",
+            odbgJSONText(plan), rebootDetail ?: @"reboot not started"];
+    }
+    return @"用法: !rescue diagnose|status | plan layout|quarantine|rollback|safe | apply <plan-id>\n";
+}
+
 /// !sym <pid|springboard> <镜像片段> <符号> —— 诊断远端符号地址解析（PAC/偏移）
 static NSString *cmdSym(NSString *arg) {
     NSArray *parts = [trim(arg) componentsSeparatedByString:@" "];
@@ -2113,7 +2455,11 @@ static NSString *cmdSpawn(NSString *arg) {
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
     free(buf);
-    return [NSString stringWithFormat:@"posix_spawn rc=%d pid=%d\n", rc, pid];
+    if (rc == 0)
+        return [NSString stringWithFormat:@"posix_spawn rc=0 pid=%d\n", pid];
+    return [NSString stringWithFormat:
+        @"posix_spawn rc=%d error=%d pid=%d（检查绝对路径、执行权限和 shebang）\n",
+        rc, rc, pid];
 }
 
 static NSString *cmdInjectImpl(NSString *arg) {
@@ -2207,7 +2553,11 @@ static NSString *odbgRunCapture(NSString *exe, NSArray<NSString *> *args, int ti
     posix_spawnattr_destroy(&attr);
     free(argv);
     close(outfd[1]);
-    if (rc != 0) { close(outfd[0]); return [NSString stringWithFormat:@"❌ posix_spawn(%@) rc=%d\n", exe, rc]; }
+    if (rc != 0) {
+        close(outfd[0]);
+        return [NSString stringWithFormat:
+            @"❌ posix_spawn(%@) rc=%d error=%d\n", exe, rc, rc];
+    }
     NSMutableData *buf = [NSMutableData data];
     fcntl(outfd[0], F_SETFL, O_NONBLOCK);
     time_t deadline = time(NULL) + timeoutSec;
@@ -2236,6 +2586,47 @@ static NSString *odbgRunCapture(NSString *exe, NSArray<NSString *> *args, int ti
     NSString *s = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
     if (!s) s = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
     return [NSString stringWithFormat:@"⏱ 超时(%d 秒)已杀，已有输出：\n%@", timeoutSec, s];
+}
+
+/// !run <路径> [参数...] —— 前台执行并捕获 stdout/stderr/退出码
+static NSString *cmdRunCapture(NSString *arg) {
+    NSArray<NSString *> *parts = [[trim(arg) componentsSeparatedByString:@" "]
+        filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    if (parts.count == 0) {
+        return @"用法: !run <路径> [参数...] 或 !run --timeout <秒> <路径> [参数...]\n";
+    }
+    int timeoutSec = 20;
+    NSUInteger first = 0;
+    if (parts.count >= 3 && [parts[0] isEqualToString:@"--timeout"]) {
+        timeoutSec = atoi(parts[1].UTF8String);
+        if (timeoutSec < 1) timeoutSec = 1;
+        if (timeoutSec > 120) timeoutSec = 120;
+        first = 2;
+    }
+    if (first >= parts.count) {
+        return @"用法: !run <路径> [参数...] 或 !run --timeout <秒> <路径> [参数...]\n";
+    }
+    NSString *exe = parts[first];
+    NSArray<NSString *> *arguments = first + 1 < parts.count
+        ? [parts subarrayWithRange:NSMakeRange(first + 1, parts.count - first - 1)]
+        : @[];
+    return odbgRunCapture(exe, arguments, timeoutSec);
+}
+
+/// !notify <name> —— 发送一次 Darwin 通知。
+/// 只发送普通通知名，不拼接 shell、不执行命令；用于可靠触发插件测试入口。
+static NSString *cmdNotify(NSString *arg) {
+    NSString *name = trim(arg);
+    if (!name.length) return @"用法: !notify <Darwin通知名>\n";
+    if (name.length > 255) return @"❌ Darwin 通知名超过 255 字节\n";
+    NSCharacterSet *forbidden = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    if ([name rangeOfCharacterFromSet:forbidden].location != NSNotFound)
+        return @"❌ Darwin 通知名不能包含空白或换行\n";
+    uint32_t status = notify_post(name.UTF8String);
+    applog(@"[notify] %@ status=%u", name, status);
+    return status == NOTIFY_STATUS_OK
+        ? [NSString stringWithFormat:@"✅ Darwin 通知已发送: %@\n", name]
+        : [NSString stringWithFormat:@"❌ Darwin 通知失败: %@ status=%u\n", name, status];
 }
 
 /// !putb <路径> <base64> —— 追加写一段二进制（WLAN 上传文件用，配 !pute 收尾）
@@ -2285,21 +2676,27 @@ static NSString *cmdRestart(void) {
 
 static NSString *helpText(void) {
     return [NSString stringWithFormat:
-        @"ODebug 常驻调试服务 odebugd %@ (pid %d)\n"
-        @"  —— LaunchDaemon，安全模式下照旧运行（插件内控制台 4321 在安全模式下不可用）\n"
+        @"ODebug 常驻调试服务 odebugd %@（进程ID %d）\n"
+        @"  —— 系统守护进程，安全模式下照旧运行（插件内控制台 4321 在安全模式下不可用）\n"
         @"安全模式:\n"
         @"  !safe status        查看标记/软链/SpringBoard\n"
         @"  !safe on            写标记 + SIGKILL SpringBoard（只有 SpringBoard 干净）\n"
         @"  !safe on all        写标记 + 重启用户空间（全部进程干净，约 20-30 秒）\n"
-        @"  !safe off           先删标记、再 SIGTERM SpringBoard（退出安全模式）\n"
+        @"  !safe off           先删标记、再强制结束 SpringBoard（退出安全模式）\n"
+        @"  !safe off all       先删标记，确认删除成功后重启用户空间\n"
         @"  !safe respring      只重启 SpringBoard（不动标记）\n"
+        @"用户空间:\n"
+        @"  !ureboot confirm    重启用户空间（不修改安全模式标记，不重启整机）\n"
+        @"SpringBoard 布局救援:\n"
+        @"  !layout status      定位真实 RecentAppLayouts 等缓存\n"
+        @"  !layout clean       时间戳可逆改名后重启用户空间（不删除）\n"
         @"调试:\n"
         @"  !ps [过滤]          进程列表（pid/uid/名字）\n"
         @"  !ls <路径>          列目录（含属主/权限/大小/软链目标）\n"
         @"  !cat <路径>         读文件（最多 512KB）\n"
         @"  !plist read <路径>  读 plist\n"
         @"注入（安全模式下把 ODebug 塞回进程）:\n"
-        @"  !auto status|on|off|run  安全模式兜底：自动把 ODebug 注入 SpringBoard（默认开）\n"
+        @"  !auto status|on|off|run  自动注入（安全模式期间暂停）\n"
         @"  !inject springboard 注入 ODebug.dylib 到 SpringBoard（自动先补 libellekit）\n"
         @"  !inject <pid>       注入到指定 pid\n"
         @"  !exec <pid>         远端 shellcode 执行探针（只写一个 flag，不加载任何库）\n"
@@ -2312,12 +2709,20 @@ static NSString *helpText(void) {
         @"  !hj <pid> write [文本]  劫持目标线程调 write(1,文本,n)，验证「劫持能不能生效」\n"
         @"  !hj <pid> open <路径>   劫持目标线程调 dlopen(路径,3)，验证「能不能把库装进去」\n"
         @"  !imgs <pid> [过滤]  列目标进程已加载的镜像（找依赖库用）\n"
+        @"  !re module <进程ID|springboard> [过滤]  复刻取证：跨进程模块路径和加载地址\n"
+        @"  !rescue diagnose    救机诊断/崩溃相关性 JSON\n"
+        @"  !rescue plan <layout|quarantine|rollback|safe>  创建一次性救援计划\n"
+        @"  !rescue apply <id>  执行计划并重启用户空间\n"
+        @"  !replica status|begin|finish|quarantine|rollback  复刻安装快照与回滚\n"
         @"  !tp <pid>           task_for_pid / 远程 VM / 远程线程可行性探针\n"
         @"  !spawn <路径> [参数] 起一个一次性进程（注入试验靶子）\n"
+        @"  !run <路径> [参数] 前台执行并捕获 stdout/stderr/退出码（默认20秒）\n"
+        @"  !run --timeout <秒> <路径> [参数] 自定义捕获超时\n"
+        @"  !notify <name>      发送一次 Darwin 通知（用于插件安全测试入口）\n"
         @"  !putb <路径> <b64> WLAN 上传：追加一段 base64（配 !pute）\n"
         @"  !pute <路径>        WLAN 上传收尾（chmod 0755 + 报大小）\n"
         @"  !dpkg <deb路径>     用 jbroot 的 dpkg 装包（装完 !restart 生效）\n"
-        @"  !restart            自杀重启 daemon（launchd KeepAlive 拉起）\n"
+        @"  !restart            结束自身并重启 odebugd（由 launchd 自动拉起）\n"
         @"  !sys                系统与服务信息\n"
         @"  !net                网络状态：绑定模式 + 手机各网卡 IP（WLAN 直连用）\n"
         @"  !vclog [秒]        读系统日志里的 VCDump（WLAN 下看目标 App 视图树，默认 20 秒）\n"
@@ -2393,13 +2798,14 @@ static NSString *systemInfo(void) {
     sysctl(mib, 2, &boot, &sz, NULL, 0);
     double up = [NSDate date].timeIntervalSince1970 - boot.tv_sec;
     return [NSString stringWithFormat:
-        @"odebugd %@  pid=%d  uid=%d  euid=%d  port=%d\n"
+        @"odebugd %@  进程ID=%d  用户ID=%d  有效用户ID=%d  监听=%s:%d  启动时间戳=%lld\n"
         @"jbroot: %@\n"
-        @"uname: %s %s %s (%s)\n"
+        @"系统内核: %s %s %s (%s)\n"
+        @"BootSessionID: %@\n"
         @"设备启动于 %.2f 小时前\n"
         @"日志: %@\n",
-        gVersion, getpid(), getuid(), geteuid(), gPort, gJbroot,
-        u.sysname, u.release, u.version, u.machine, up / 3600.0, gLogPath];
+        gVersion, getpid(), getuid(), geteuid(), gBindAny ? "0.0.0.0" : "127.0.0.1", gPort, (long long)gStartedAt, gJbroot,
+        u.sysname, u.release, u.version, u.machine, bootSessionIdentifier(), up / 3600.0, gLogPath];
 }
 
 static NSString *tailLog(NSString *arg) {
@@ -2443,10 +2849,15 @@ static NSString *cmdInject(NSString *arg) {
     return r;
 }
 
-/// 安全模式兜底看门狗（★ 这是本项目「安全模式下也能用」的最后一环）：
-/// SpringBoard 如果在「安全模式开启时」启动，tweak 加载器就没跑 ⇒ ODebug.dylib 不在 SB 里 ⇒
-/// 插件内的 4321 控制台是死的（而且控制台自己没法自救：它压根没被加载）。
-/// odebugd 是 LaunchDaemon，安全模式下照旧常驻，所以由它盯着 SB：发现 SB 里没有 ODebug 就注入。
+// Fail closed for either active jbroot marker. A dangling symlink alone is not active.
+static BOOL odbgSafeModeActive(void) {
+    if (access(markerPath().fileSystemRepresentation, F_OK) == 0) return YES;
+    struct stat st;
+    if (lstat(markerLinkPath().fileSystemRepresentation, &st) == 0 && !S_ISLNK(st.st_mode)) return YES;
+    return access(markerLinkPath().fileSystemRepresentation, F_OK) == 0;
+}
+
+/// 正常模式下注入兜底；安全模式存在时暂停自动注入，独立守护进程仍可提供控制台。
 /// 注入本身只能在目标「有用户态线程」的瞬间做（实测 SB 空闲时窗口率约 2%），所以会等 1~3 分钟。
 static void *autoInjectThread(void *arg) {
     (void)arg;
@@ -2457,6 +2868,12 @@ static void *autoInjectThread(void *arg) {
     for (;;) {
         sleep(5);
         if (!gAutoInject) continue;
+        if (odbgSafeModeActive()) {
+            if (announced != -1) applog(@"[watchdog] 安全模式标记存在，暂停自动注入；守护进程继续运行");
+            announced = -1;
+            continue;
+        }
+        if (announced == -1) announced = 0;
         pid_t sb = pidOfName("SpringBoard");
         if (sb <= 0) continue;
         if (lastSb && sb != lastSb) {   // SB 换 pid 了：是「按预期重启」还是「我们刚注入它就死」？
@@ -2481,7 +2898,7 @@ static void *autoInjectThread(void *arg) {
         if (odbgHasImage(sb, "ODebug.dylib")) { announced = 0; continue; }   // 已经在里面了（正常模式或之前注入过）
         if (gAutoInject == 0) continue;
         if (announced != sb) {
-            applog(@"[watchdog] SpringBoard(%d) 里没有 ODebug.dylib（多半是安全模式启动的）⇒ 自动兜底注入", sb);
+            applog(@"[watchdog] SpringBoard(%d) 里没有 ODebug.dylib ⇒ 自动兜底注入", sb);
             announced = sb;
         }
         NSString *dylib = odbgDefaultPluginPath();
@@ -2506,18 +2923,19 @@ static NSString *cmdAuto(NSString *arg) {
     BOOL has = (sb > 0) ? odbgHasImage(sb, "ODebug.dylib") : NO;
     if (a.length == 0 || [a hasPrefix:@"status"]) {
         return [NSString stringWithFormat:
-            @"自动兜底注入（安全模式）: %@\n"
+            @"自动兜底注入: %@；安全模式: %@\n"
             @"  SpringBoard pid=%d，ODebug.dylib %@\n"
             @"  机制: 每 5 秒查一次；发现 SB 里没有 ODebug 就注入（等「用户态窗口」，可能等 1~3 分钟）\n"
-            @"  触发场景: 安全模式开启时启动的 SB —— 插件 4321 控制台是死的，注入后无需 respring 即恢复\n"
+            @"  安全模式期间暂停自动注入，!auto run 不执行注入\n"
             @"  !auto on | !auto off | !auto run（立刻试一次）\n",
-            gAutoInject ? @"已开启 ✅" : @"已停用 ⛔", sb,
+            gAutoInject ? @"已开启 ✅" : @"已停用 ⛔", odbgSafeModeActive() ? @"活动（自动注入暂停）" : @"未检测到标记", sb,
             sb > 0 ? (has ? @"已在镜像表里 ✅" : @"不在镜像表里 ❌") : @"（找不到 SB）"];
     }
-    if ([a hasPrefix:@"on"])  { gAutoInject = 1; applog(@"[auto] 开启自动兜底"); return @"自动兜底注入已开启 ✅\n"; }
+    if ([a hasPrefix:@"on"])  { gAutoInject = 1; applog(@"[auto] 开启自动兜底"); return odbgSafeModeActive() ? @"自动兜底已开启；安全模式期间暂停注入\n" : @"自动兜底注入已开启 ✅\n"; }
     if ([a hasPrefix:@"off"]) { gAutoInject = 0; applog(@"[auto] 停用自动兜底"); return @"自动兜底注入已停用 ⛔（!auto on 可再开）\n"; }
     if ([a hasPrefix:@"run"]) {
         if (sb <= 0) return @"❌ 找不到 SpringBoard\n";
+        if (odbgSafeModeActive()) return @"❌ 安全模式期间禁止 !auto run 注入；请先退出安全模式\n";
         NSString *dylib = odbgDefaultPluginPath();
         return [NSString stringWithFormat:@"⚙️ 手动按兜底路径注入 SB(%d)…\n%@", sb,
                 cmdInject([NSString stringWithFormat:@"%d %@", sb, dylib])];
@@ -2531,6 +2949,8 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd isEqualToString:@"help"] || [cmd isEqualToString:@"?"] || [cmd isEqualToString:@"h"]) return helpText();
     if ([cmd isEqualToString:@"!exit"] || [cmd isEqualToString:@"exit"] || [cmd isEqualToString:@"quit"]) return @"__BYE__";
     if ([cmd hasPrefix:@"!safe"]) return cmdSafe([cmd substringFromIndex:5]);
+    if ([cmd hasPrefix:@"!layout"]) return cmdLayout([cmd substringFromIndex:7]);
+    if ([cmd hasPrefix:@"!ureboot"]) return cmdUserspaceReboot([cmd substringFromIndex:8]);
     if ([cmd hasPrefix:@"!ps"]) return allProcs(trim([cmd substringFromIndex:3]));
     if ([cmd hasPrefix:@"!ls "]) return listDir(trim([cmd substringFromIndex:4]));
     if ([cmd hasPrefix:@"!cat "]) {
@@ -2560,12 +2980,17 @@ static NSString *dispatchCommand(NSString *cmd) {
     if ([cmd hasPrefix:@"!pth "]) return cmdPthreadDlopen([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!rx "]) return cmdRxTest([cmd substringFromIndex:4]);
     if ([cmd hasPrefix:@"!spawn "]) return cmdSpawn([cmd substringFromIndex:7]);
+    if ([cmd hasPrefix:@"!run "]) return cmdRunCapture([cmd substringFromIndex:5]);
+    if ([cmd hasPrefix:@"!notify "]) return cmdNotify([cmd substringFromIndex:8]);
     if ([cmd hasPrefix:@"!putb "]) return cmdPutBegin([cmd substringFromIndex:6]);
     if ([cmd hasPrefix:@"!pute "]) return cmdPutEnd([cmd substringFromIndex:6]);
     if ([cmd hasPrefix:@"!pute"]) return cmdPutEnd(trim([cmd substringFromIndex:5]));
     if ([cmd hasPrefix:@"!dpkg "]) return cmdDpkgInstall([cmd substringFromIndex:6]);
     if ([cmd hasPrefix:@"!restart"]) return cmdRestart();
     if ([cmd hasPrefix:@"!imgs"]) return cmdImages([cmd substringFromIndex:5]);
+    if ([cmd isEqualToString:@"!re"] || [cmd hasPrefix:@"!re "]) return cmdRE([cmd substringFromIndex:3]);
+    if ([cmd isEqualToString:@"!rescue"] || [cmd hasPrefix:@"!rescue "]) return cmdRescue([cmd substringFromIndex:7]);
+    if ([cmd isEqualToString:@"!replica"] || [cmd hasPrefix:@"!replica "]) return cmdReplica([cmd substringFromIndex:8]);
     if ([cmd hasPrefix:@"!sym "]) return cmdSym([cmd substringFromIndex:5]);
     if ([cmd hasPrefix:@"!tp "]) return cmdTaskProbe([cmd substringFromIndex:4]);
     if ([cmd isEqualToString:@"!sys"]) return systemInfo();
@@ -2623,8 +3048,13 @@ static void *beaconThread(void *unused) {
             if (strcmp(ipbuf, "?") == 0 && any[0]) strncpy(ipbuf, any, sizeof(ipbuf) - 1);
             freeifaddrs(ifa);
         }
-        char msg[160];
-        snprintf(msg, sizeof(msg), "ODEBUGD_BEACON %s %d %s", ipbuf, gPort, gVersion.UTF8String);
+        char host[256] = "iPhone";
+        size_t hostLen = sizeof(host);
+        if (sysctlbyname("kern.hostname", host, &hostLen, NULL, 0) != 0 || !host[0])
+            strlcpy(host, "iPhone", sizeof(host));
+        for (char *c = host; *c; c++) if (*c == ' ' || *c == '\t') *c = '_';
+        char msg[384];
+        snprintf(msg, sizeof(msg), "ODEBUGD_BEACON %s %d %s %s", ipbuf, gPort, gVersion.UTF8String, host);
         struct sockaddr_in a = {0};
         a.sin_len = sizeof(a);
         a.sin_family = AF_INET;
@@ -2641,8 +3071,11 @@ static void *beaconThread(void *unused) {
 static void *bonjourThread(void *unused) {
     @autoreleasepool {
         static OdbgBonjourLogger *lg;
+        char host[256] = "iPhone";
+        size_t hostLen = sizeof(host);
+        if (sysctlbyname("kern.hostname", host, &hostLen, NULL, 0) != 0 || !host[0]) strlcpy(host, "iPhone", sizeof(host));
         NSNetService *svc = [[NSNetService alloc] initWithDomain:@"" type:@"_odebugd._tcp."
-                                                             name:@"odebugd" port:gPort];
+                                                             name:@(host) port:gPort];
         lg = [[OdbgBonjourLogger alloc] init];
         svc.delegate = lg;
         [svc setTXTRecordData:[@"path=/" dataUsingEncoding:NSUTF8StringEncoding]];
@@ -2690,19 +3123,50 @@ static void odbgLogFootprint(const char *tag) {
     applog(@"[%s] pid=%d rss=%.1f MB 端口名=%u", tag, getpid(), rss / 1048576.0, ports);
 }
 
+/// 判断该连接是否来自本机回环（VCDUMP 免 token 通道只对本机 App 开放）
+static BOOL odbgPeerIsLoopback(int fd) {
+    struct sockaddr_in peer;
+    socklen_t len = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &len) != 0) return NO;
+    if (peer.sin_family != AF_INET) return NO;
+    return ntohl(peer.sin_addr.s_addr) == INADDR_LOOPBACK;
+}
+
+static const char kODebugResponseEnd[] = "__ODEBUG_END__\n";
+
+static void odbgWriteAll(int fd, const char *text, size_t length) {
+    while (length > 0) {
+        ssize_t written = write(fd, text, length);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return;
+        text += written;
+        length -= (size_t)written;
+    }
+}
+
 static void clientLoop(int fd) {
     NSString *banner = [NSString stringWithFormat:
-        @"ODebug 常驻调试服务 odebugd %@ (pid %d, root, 端口 %d) — 安全模式下也可用\n"
+        @"ODebug 常驻调试服务 odebugd %@（进程ID %d，超级用户，端口 %d）— 安全模式下也可用\n"
         @"输入 help 看命令菜单（可连续输入多条）\n", gVersion, getpid(), gPort];
     write(fd, banner.UTF8String, strlen(banner.UTF8String));
     applog(@"+conn fd=%d", fd);
     odbgLogFootprint("conn+");
+
+    BOOL fromLoopback = odbgPeerIsLoopback(fd);
+    NSString *connToken = loadToken();   // 每条连接读一次；!token 改完重连即生效
 
     char buf[4096];
     NSMutableString *pending = [NSMutableString string];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n <= 0) break;
+        // 单行缓冲上限 64KB：防止客户端一直发不带换行的数据把内存撑爆
+        if (pending.length > 65536) {
+            [pending setString:@""];
+            NSString *no = @"❌ 输入过长（>64KB 无换行），已丢弃该段\n";
+            write(fd, no.UTF8String, strlen(no.UTF8String));
+            continue;
+        }
         [pending appendString:[[NSString alloc] initWithBytes:buf length:n encoding:NSUTF8StringEncoding] ?: @""];
         NSRange nl;
         while ((nl = [pending rangeOfString:@"\n"]).location != NSNotFound) {
@@ -2712,8 +3176,13 @@ static void clientLoop(int fd) {
             if (line.length == 0) continue;
             NSString *cmd = line;
             if ([[line uppercaseString] hasPrefix:@"VCDUMP "]) {
-                // 注入到目标 App 的 ODebug.dylib 回传视图树（免 token：内容只是视图树文本，
-                // 且来自本机 App；WLAN 下 Mac 没有 idevicesyslog，走这条路显示）
+                // 注入到目标 App 的 ODebug.dylib 回传视图树（免 token，但只收本机回环来源：
+                // App 就在本机走 127.0.0.1；WLAN 模式下拒绝外部伪造/污染日志）
+                if (!fromLoopback) {
+                    NSString *no = @"❌ VCDUMP 仅接受本机回环连接\n";
+                    write(fd, no.UTF8String, strlen(no.UTF8String));
+                    continue;
+                }
                 // App 侧发的是单行 base64（多行裸文本会被本循环按行截断）；兼容旧明文
                 NSString *body = [line substringFromIndex:7];
                 NSData *dec = [[NSData alloc] initWithBase64EncodedString:body options:0];
@@ -2721,19 +3190,23 @@ static void clientLoop(int fd) {
                 odbgVcDumpAppend(txt ?: body);
                 write(fd, "ok\n", 3);
                 continue;
-            }
-            if ([[line uppercaseString] hasPrefix:@"AUTH "]) {
+            } else if ([[line uppercaseString] hasPrefix:@"AUTH "]) {
                 NSArray *parts = [line componentsSeparatedByString:@" "];
                 if (parts.count < 3) continue;
                 NSString *token = parts[1];
                 NSRange rest = [line rangeOfString:parts[2]];
                 cmd = rest.location == NSNotFound ? @"" : [line substringFromIndex:rest.location];
-                NSString *expect = loadToken();
-                if (!expect.length || ![token isEqualToString:expect]) {
+                if (!connToken.length || ![token isEqualToString:connToken]) {
                     NSString *no = @"❌ 未认证: 请发送 AUTH <token> <命令>（令牌见 ODebug 设置页 / ODebug.plist 的 debugAuthToken）\n";
                     write(fd, no.UTF8String, strlen(no.UTF8String));
                     continue;
                 }
+            } else {
+                // ★ 安全红线：没有 AUTH 前缀的命令一律不执行。
+                //   此前这里会把整行当命令直接跑，等于 4322 上的免密 root 后门（!spawn/!dpkg/!cat 全可用）。
+                NSString *no = @"❌ 未认证: 命令必须以 AUTH <token> <命令> 开头（令牌见 ODebug 设置页）\n";
+                write(fd, no.UTF8String, strlen(no.UTF8String));
+                continue;
             }
             applog(@"cmd: %@", cmd);
             NSString *rsp = dispatchCommand(cmd);
@@ -2745,7 +3218,15 @@ static void clientLoop(int fd) {
                 close(fd);
                 return;
             }
-            if (rsp.length) write(fd, rsp.UTF8String, strlen(rsp.UTF8String));
+            if (rsp.length) {
+                odbgWriteAll(fd, rsp.UTF8String,
+                             [rsp lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+            }
+            // Explicit response boundary: the shell client can return as soon
+            // as the command is complete instead of waiting for a fixed idle
+            // timeout. Old clients that do not know this line simply see an
+            // extra line and keep their previous behavior.
+            odbgWriteAll(fd, kODebugResponseEnd, sizeof(kODebugResponseEnd) - 1);
         }
     }
     applog(@"-conn fd=%d", fd);
@@ -2764,6 +3245,7 @@ static void *clientThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        gStartedAt = time(NULL);
         signal(SIGPIPE, SIG_IGN);
         gJbroot = findJbroot();
         if (!gJbroot) {
@@ -2773,6 +3255,8 @@ int main(int argc, char **argv) {
         NSString *logDir = [gJbroot stringByAppendingString:@"/var/log"];
         [[NSFileManager defaultManager] createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:NULL];
         gLogPath = [logDir stringByAppendingPathComponent:@"odebugd.log"];
+        restoreEarlyRescuePlist();
+        installStableRescueHelper();
         odbgInstallCrashHandlers();
 
         const char *pe = getenv("ODEBUGD_PORT");
@@ -2799,6 +3283,13 @@ int main(int argc, char **argv) {
                 id v = d[@"debugBindAll"];
                 if ([v respondsToSelector:@selector(boolValue)]) { gBindAny = [v boolValue]; break; }
             }
+        }
+
+        // ★ 安全：WLAN 直连（绑 0.0.0.0）不允许继续用出厂默认令牌，
+        //   否则同网段任何人都能凭 "opendebug" 拿到 root 调试通道。降级为仅回环并留日志。
+        if (gBindAny && [loadToken() isEqualToString:@"opendebug"]) {
+            applog(@"⚠️ 拒绝 WLAN 直连：仍在使用默认令牌 opendebug，已降级为仅回环监听。请先在 ODebug 设置页改成自定义令牌");
+            gBindAny = 0;
         }
 
         applog(@"==== odebugd %@ 启动 (jbroot=%@, port=%d, uid=%d) ====", gVersion, gJbroot, gPort, getuid());
@@ -2829,7 +3320,7 @@ int main(int argc, char **argv) {
 
         pthread_t wd;
         if (pthread_create(&wd, NULL, autoInjectThread, NULL) == 0) pthread_detach(wd);
-        applog(@"安全模式兜底看门狗已启动（!auto status 查看）");
+        applog(@"注入看门狗已启动（安全模式暂停自动注入；!auto status 查看）");
 
         for (;;) {
             int fd = accept(srv, NULL, NULL);

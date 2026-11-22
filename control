@@ -1,10 +1,10 @@
 Package: com.tanyou.odebug
 Name: ODebug
 Depends: mobilesubstrate
-Changelog: 1.0.153: 新增 !vccl 清空回传缓冲,odebug.sh 触发前自动清,只显示本次视图树 | 1.0.152: 修复,WLAN 视图树回传只显示标题不显示树的问题 | 1.0.151: 修 WLAN 视图树回传根因（Darwin 监听注册从未生效，现所有被注入进程都注册） | 1.0.148: !vclog 回传通道，App 侧 dump 直连 4322 上报（iOS17 无 log 命令、WLAN 下原无法显示视图树） | 1.0.146: Changelog 改单行格式（多行 x 真实 payload 触发 Sileo Bad deb） | 1.0.142: WLAN 直连 + !putb/!pute/!dpkg/!restart 纯 Wi-Fi 自更新 | 1.0.141: 注入器按 frida-core 复刻定型，安全模式下看门狗自动注回 SpringBoard
+Changelog: 1.0.181: odebugd 为每条命令追加结束标记，odebug.sh 收到标记立即退出，移除短命令固定等待 1 秒与 WLAN 固定等待 2 秒造成的卡顿，并兼容未升级的 4321 控制台；1.0.180: 4322 菜单新增 o 一键进入安全模式并重启用户空间，m 改为安全模式向导菜单，进入/退出与 SpringBoard/用户空间重启均可按数字选择；1.0.179: 新增 !ureboot 用户空间重启与 !safe off all 退出安全模式后重启用户空间，菜单增加 w/e 入口并把运行状态提示统一为中文；1.0.178: 新增 !notify 受控 Darwin 通知命令，用于直接触发插件测试与浮窗入口；1.0.177: !re ui 合并 scene windows 与 UIApplication.windows 并按对象身份去重，纳入多屏独立 overlay；1.0.176: 新增 !re invoke0 无参 BOOL 方法调用，区分 false 与 nil；1.0.175: !re selector 支持 +Class/-Class 强制类方法/实例方法并输出 requestedKind；1.0.174: !run/!spawn 失败直接报告 posix_spawn 返回码，避免读取未同步 errno；1.0.173: !run spawn 失败补充错误码；1.0.172: 运行时 gVersion 与 control 版本一致性回归；1.0.171: !re selector 类名目标先查实例方法并报告 methodKind；新增 !run 前台命令输出/退出码捕获与超时；1.0.170: 收紧 replica 状态机，finish 只接受 snapshotted/installed，quarantine 只接受 active/snapshotted/installed，rollback 拒绝重复回滚；1.0.169: replica finish/active 状态和安装后哈希；1.0.168: !rescue diagnose/plan/apply、!replica 快照/隔离/回滚、崩溃证据和安装健康守护器；1.0.167: hook TTL 持久化与并发修复；1.0.166: 地址换算、UI JSON、Frida 模板和补丁账本；1.0.165: hook/intercept/trace；1.0.164: evidence input；1.0.163: !re 基础命名空间；1.0.162: BootSessionID；1.0.161: 布局备份；1.0.160: rescue 健康检测；1.0.159: 早期救援启动链
 Architecture: iphoneos-arm64e
-Version: 1.0.153
-Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322（frida 式进程外注入器：安全模式/所有插件禁止注入时自动把插件注回 SpringBoard，4321 当场复活，无需 respring）
+Version: 1.0.181
+Description: Open 插件的 TCP 调试控制台（独立插件）：端口4321调试 + 注入目标 App 视图树 dump；常驻服务 odebugd 端口4322；BaseBin 早期 rescue + Library 耐久修复 job 校验注册、PID 与 4322，仅恢复卡死的 odebugd；!layout clean 可逆备份布局缓存后重启用户空间；不注入、不触碰安全标记、不重启 SpringBoard/设备
 Maintainer: tanyou
 Author: tanyou
 Section: Tweaks
